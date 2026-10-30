@@ -1,0 +1,29 @@
+# STM32CubeIDE build çıktıları ve ST kütüphaneleri (CubeMX ile yeniden üretilir)
+firmware/stm32wl-node-gateway/STM32CubeIDE/Debug/
+firmware/stm32wl-node-gateway/STM32CubeIDE/Release/
+firmware/stm32wl-node-gateway/Drivers/
+firmware/stm32wl-node-gateway/Middlewares/
+firmware/stm32wl-node-gateway/Utilities/
+*.elf
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+*.before_*
+*_bak
+
+# ESP-IDF
+firmware/esp32c3-ble-bridge/build/
+firmware/esp32c3-ble-bridge/sdkconfig
+firmware/esp32c3-ble-bridge/sdkconfig.old
+firmware/esp32c3-ble-bridge/managed_components/
+
+# Flutter
+app/lora_tracker/build/
+app/lora_tracker/.dart_tool/
+app/lora_tracker/assets/*.mbtiles
+app/lora_tracker/android/local.properties
+app/lora_tracker/android/.gradle/
+*.apk
