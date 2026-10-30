@@ -28,9 +28,9 @@ ESP32 BLE köprüsüne bağlanıp node'dan gelen "kim nerede" tablosunu haritada
 1. Offline haritayı `assets/map.mbtiles` olarak ekle (repoda yok, ~15 MB). Örneğin OpenStreetMap verisinden ilgili bölge için raster mbtiles üretilebilir.
 2. Repoda yalnızca uygulama kodu ve Android manifest'i var. Platform iskelet dosyalarını üretmek için klasörde bir kez `flutter create --platforms=android,ios .` çalıştır (mevcut dosyaların üzerine yazmaz).
 3. `flutter pub get`
-4. `flutter run` (Android). iOS projesi mevcut, derlemek için macOS/Xcode gerekir.
+4. `flutter run` (Android). iOS için derleme macOS/Xcode gerektirir.
 
-İzinler: Bluetooth tarama/bağlanma ve konum (AndroidManifest ve Info.plist içinde tanımlı).
+İzinler: Bluetooth tarama/bağlanma ve konum (`android/app/src/main/AndroidManifest.xml`). iOS'ta `Info.plist` içine `NSBluetoothAlwaysUsageDescription` ve `NSLocationWhenInUseUsageDescription` eklenmeli.
 
 ## Ekran görüntüleri
 
