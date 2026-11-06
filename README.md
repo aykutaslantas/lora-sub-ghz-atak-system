@@ -63,8 +63,3 @@ Zybo PL tasarımı ve admin GUI ekip arkadaşıma ait olduğu için bu repoda yo
 1. **Firmware:** [firmware/stm32wl-node-gateway/README.md](firmware/stm32wl-node-gateway/README.md). `net_key.example.h` → `net_key.h`, `app_mode.h` ile rolü seç, STM32CubeIDE'de derle.
 2. **BLE köprüsü:** `idf.py set-target esp32c3` (ya da `esp32s3`) → `idf.py build flash monitor`.
 3. **Uygulama:** harita dosyasını `assets/map.mbtiles` olarak ekle → `flutter run`. iPhone için: [app/lora_tracker/README.md](app/lora_tracker/README.md).
-
-## Ekip
-
-- **Aykut İsmet Aslantaş:** STM32WL firmware, protokol (JOIN, ACK, mesh, güvenlik), ESP32 köprüsü, Flutter uygulaması
-- **Ekip arkadaşları:** Zybo PL tasarımı (UART, AES çekirdeği, whitelist, tablo), PetaLinux ve admin GUI
