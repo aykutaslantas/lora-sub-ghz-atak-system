@@ -1,39 +1,44 @@
 # lora_tracker: offline taktik harita uygulaması
 
-ESP32 BLE köprüsüne bağlanıp node'dan gelen "kim nerede" tablosunu haritada gösteren, ATAK'a benzer yatay arayüzlü Flutter uygulaması. **İnternet gerektirmez.**
+ESP32 BLE köprüsüne bağlanıp node'dan gelen "kim nerede" tablosunu haritada gösteren, ATAK'a benzer yatay arayüzlü Flutter uygulaması. **İnternet gerektirmez.** Android ve iOS.
 
 ## Özellikler
 
-- Node'ları offline haritada gösterme (0xD1 tablo), son görülme ve GPS fix durumu
-- Uzun basınca açılan **radyal menü** ile işaret koyma: ilgi noktası, tehlike, toplanma, buraya gel, burada bekle, bölgeyi kontrol et
-- İşaret silme isteği gönderme (0xC2), admin kararıyla haritadan kaldırma (0xC3)
-- Admin'den gelen **"GERİ DÖN"** komutunda uyarı, hedefe kesikli çizgi, mesafe/yön şeridi ve **Bul** ekranı
-- Telefonun kendi GPS'i ile konum (geolocator), testte haritadan elle konum seçme
+- Node'ları offline haritada **takım renkleri ve adlarıyla** gösterme (ör. ALPHA-2); takımsız node'lar kırmızı ve hex adresle
+- **Takım / Kimlik** ekranı: takım, numara (0 = admin seçsin), PIN ile katılma; durum (onay bekleniyor, red sebebi, önerilen numara), takımdan ayrılma, admin atınca uyarı
+- **Konum paylaşımı:** telefonun GPS'i node'un konumu olarak yayınlanır (`0xC4`)
+- **Admin ✓** çipi: node'un son konumu admin'in tablosunda mı (doğrudan / aktarımla / yok)
+- Radyal menüyle işaret ve komut: ilgi noktası, tehlike, toplanma, buraya gel, burada bekle, bölgeyi kontrol et; ✓ gönderildi, ✓✓ ağa ulaştı
+- Admin komutlarında uyarı penceresi; Tamam / Bul ile OKUNDU onayı
+- İşaret silme isteği, admin kararıyla kaldırma; **Bul** ekranında hedefe yön ve mesafe
 
 ## Dosyalar
 
 | Dosya | İçerik |
 |---|---|
-| `lib/main.dart` | BLE tarama/bağlantı, gelen paketlerin yönlendirilmesi |
-| `lib/table_parser.dart` | 0xD1 tablo çözümleyici |
-| `lib/cmd_packet.dart` | 0xC1 / 0xC2 / 0xC3 paket kodlama-çözme |
+| `lib/main.dart` | BLE tarama/bağlantı, gelen paketlerin yönlendirilmesi, durum çubuğu |
+| `lib/cmd_packet.dart` | Kontrol, konum, ACK, node durumu ve katılma paketleri |
+| `lib/table_parser.dart` | `0xD1` tablo çözücü |
+| `lib/teams.dart` | Takım adları ve renkleri, adres → ad (ALPHA-2) |
+| `lib/join_page.dart` | Takım / Kimlik ekranı |
 | `lib/map_view.dart` | flutter_map + mbtiles harita, node ve işaret katmanları |
-| `lib/marks.dart` | İşaret modeli ve yönetimi |
-| `lib/radial_menu.dart` | İşaret seçme menüsü |
-| `lib/find_page.dart` | Hedefe yön/mesafe gösteren Bul ekranı |
-| `lib/location_service.dart` | Telefon GPS'i |
+| `lib/marks.dart`, `lib/radial_menu.dart` | İşaret modeli ve seçme menüsü |
+| `lib/find_page.dart` | Bul ekranı |
+| `lib/location_service.dart` | Telefon GPS'i, testte elle konum |
 
-## Çalıştırma
+## Çalıştırma (Android)
 
-1. Offline haritayı `assets/map.mbtiles` olarak ekle (repoda yok, ~15 MB). Örneğin OpenStreetMap verisinden ilgili bölge için raster mbtiles üretilebilir.
-2. Repoda yalnızca uygulama kodu ve Android manifest'i var. Platform iskelet dosyalarını üretmek için klasörde bir kez `flutter create --platforms=android,ios .` çalıştır (mevcut dosyaların üzerine yazmaz).
-3. `flutter pub get`
-4. `flutter run` (Android). iOS için derleme macOS/Xcode gerektirir.
+1. Offline haritayı `assets/map.mbtiles` olarak ekle (repoda yok, ~15 MB).
+2. Android iskelet dosyaları eksikse klasörde bir kez `flutter create --platforms=android .` (mevcut dosyaların üzerine yazmaz).
+3. `flutter pub get` → `flutter run`.
 
-İzinler: Bluetooth tarama/bağlanma ve konum (`android/app/src/main/AndroidManifest.xml`). iOS'ta `Info.plist` içine `NSBluetoothAlwaysUsageDescription` ve `NSLocationWhenInUseUsageDescription` eklenmeli.
+## iPhone (Mac olmadan)
 
-## Ekran görüntüleri
+1. Repoda **Actions → iOS unsigned IPA → Run workflow**. Derleme için harita dosyasının da repoda olması gerekir (`.gitignore`'daki `assets/*.mbtiles` satırı yüzünden şu an yok).
+2. Bitince artifact'tan `lora_tracker-unsigned.ipa`'yı indir.
+3. Windows'ta **Sideloadly** (iTunes ve iCloud apple.com'dan kurulu olmalı) ile kendi Apple ID'nle iPhone'a yükle.
+4. iPhone'da Ayarlar → Genel → VPN ve Cihaz Yönetimi → profile güven; iOS 16+ için Gizlilik ve Güvenlik → Geliştirici Modu.
 
-![Harita](../../docs/images/app-map.png)
-![Radyal menü](../../docs/images/app-radial-menu.png)
-![Geri dön uyarısı](../../docs/images/app-go-back.png)
+Ücretsiz Apple ID ile yükleme 7 günde bir yenilenmeli (aynı `.ipa` tekrar yüklenir). Private repoda macOS dakikaları sınırlı (ücretsiz planda ayda ~190 dakika, bir derleme ~10–15 dakika).
+
+İzinler: Bluetooth ve konum (Android `AndroidManifest.xml`, iOS `Info.plist`). iPhone'da uygulama arka plana atılınca BLE durur; ön planda tutun.

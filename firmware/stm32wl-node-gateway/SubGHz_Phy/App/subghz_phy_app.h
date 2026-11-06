@@ -47,6 +47,13 @@ typedef struct __attribute__((packed))
 } pos_packet_t;
 
 #define POS_FLAG_FIX   0x01
+/* bit1: gonderen admin'e ulasamiyor (REACH_TIMEOUT_MS boyunca tabloda kendini gormedi),
+   admin'e ulasan bir komsu bu paketi bir kez aktarsin (tek sekme mesh) */
+#define POS_FLAG_RELAY_REQ   0x02
+/* bit2: GATEWAY koyar = bu konum Zybo'ya komsu uzerinden (0xE1) ulasti. Zybo bayraklari
+   oldugu gibi saklayip tabloda geri yolladigi icin node kendi kaydinda bunu gorur:
+   aktarimla ulasiyorsa "beni aktarin" istegini acik tutar (salinim olmaz). */
+#define POS_FLAG_VIA_RELAY   0x04
 
 /* Faz 2: isaret / komut paketi, havaya giden 15 byte (little-endian, padding yok).
    Telefon -> BLE -> ESP32 -> UART -> node -> LoRa -> gateway (tekrar yayin) -> herkes */
@@ -150,13 +157,174 @@ typedef struct __attribute__((packed))
         src=0xFFFE  [6]=karar (1 onay, 2 red)  [7..8]=hedef src  [9]=hedef msg_id  [10]=istek msg_id */
 #define CMD_TYPE_DEL_REQ                            0xC2
 #define CMD_TYPE_DEL_ACK                            0xC3
-#define IS_CTRL_TYPE(t)                             (((t) == CMD_TYPE) || ((t) == CMD_TYPE_DEL_REQ) || ((t) == CMD_TYPE_DEL_ACK))
+/* 0xC5 KOMUT ACK: node -> gateway -> Zybo (havada tekrar yayinlanmaz)
+        [1..2]=node adresi [3..4]=0xFFFE [5]=node'un ACK sayaci (tekrar elemek icin)
+        [6]=tur (1 ULASTI: node aldi, 2 OKUNDU: telefonda kullanici gordu)
+        [7..8]=onaylanan komutun src (0xFFFE) [9]=onaylanan komutun msg_id [10..14]=0
+   ULASTI: admin'in o node'a ozel (dst = node) her 0xC1 kopyasina yollanir.
+   OKUNDU: telefon, admin komut uyarisinda kullanici Tamam/Bul'a basinca yollar. */
+#define CMD_TYPE_ACK                                0xC5
+#define ACK_KIND_DELIVERED                          1
+#define ACK_KIND_SEEN                               2
+/* ACK guvenilirligi: her ACK (ULASTI / OKUNDU) ACK_REPEAT kez yollanir (her seferinde yeni
+   ack_seq). Ilki kisa rastgele gecikmeyle, sonrakiler gateway'in 3x yayin penceresinin
+   (~1.2 sn) disina dussun diye daha uzun rastgele arayla. Zybo (src, hedef msg_id, tur)
+   ile tekrarlari eler. Ayni ACK tekrarlanirken komutun yeni kopyalari yeni ACK baslatmaz;
+   tekrarlar bittikten sonra komut yine gelirse (Zybo yeniden denedi) ACK yeniden baslar. */
+#define ACK_REPEAT                                  3
+#define ACK_Q_SIZE                                  3
+#define ACK_FIRST_DELAY_MIN_MS                      30
+#define ACK_FIRST_DELAY_RAND_MS                     170
+#define ACK_REPEAT_GAP_MIN_MS                       500
+#define ACK_REPEAT_GAP_RAND_MS                      1500
+#define IS_CTRL_TYPE(t)                             (((t) == CMD_TYPE) || ((t) == CMD_TYPE_DEL_REQ) || ((t) == CMD_TYPE_DEL_ACK) || ((t) == CMD_TYPE_ACK) || \
+                                                     ((t) == JOIN_TYPE_KICK) || ((t) == JOIN_TYPE_LEAVE))
+/* 15 B kontrol tipinin 4 bitlik etiketi (tekrar eleme / aktarim anahtarlari): 0xC1..0xC5 -> 1..5,
+   0xA2..0xA4 -> 0xA..0xC (0xC3 ile 0xA3 karismasin) */
+#define CTRL_TAG(t)                                 ((((t) & 0xF0U) == 0xA0U) ? (0x08U | ((t) & 0x07U)) : ((t) & 0x0FU))
 #define ADDR_ADMIN                                  0xFFFE
 /* 0xC1 tur (kind): 1 ilgi, 2 tehlike, 3 toplanma, 4 buraya gel, 5 bekle, 6 kontrol,
    7 GERI DON (sadece admin -> tek node; telefon koyamaz) */
 #define CMD_KIND_MIN                                1
 #define CMD_KIND_PHONE_MAX                          6
 #define CMD_KIND_GO_BACK                            7
+/* 0xC4 KONUMUMU AYARLA: telefon -> ESP32 -> SADECE bagli node (LoRa'ya hic cikmaz).
+   [0]=0xC4 [1..4] lat i32 x1e7 [5..8] lon i32 x1e7 [9] 1=ayarla / 0=sahte konuma don
+   Node bu konumu fix=1 ile yayinlar. POS_OVERRIDE_TIMEOUT_MS boyunca yenisi
+   gelmezse (telefon koptu) sahte konuma doner. */
+#define CMD_TYPE_SET_POS                            0xC4
+#define POS_OVERRIDE_TIMEOUT_MS                     60000
+/* 0xC6 NODE DURUMU: node -> ESP32 -> telefon (SADECE yerel, LoRa'ya cikmaz), her tablodan sonra.
+   Dolayli onay: Zybo tablosunda (0xD1) kendi kaydimiz var mi, varsa hangi seq.
+   [0]=0xC6 [1..2]=node adresi [3]=son yollanan konum seq'i [4]=tabloda var mi (1/0)
+   [5]=tablodaki seq [6]=tablodaki flags [7]=0 */
+#define CMD_TYPE_NODE_STATUS                        0xC6
+#define NODE_STATUS_LEN                             8
+
+/* ---- Tek sekme mesh: aktarilmis konum ----
+   0xE1 AKTARILMIS KONUM: komsu node -> gateway (aktarilmis paket tekrar aktarilmaz)
+   [0]=0xE1 [1..2]=aktaran node adresi [3]=aktaranin orijinali duydugu RSSI (i8)
+   [4]=SNR (i8) [5..16]=orijinal pos_packet_t (degistirilmeden)
+   Gateway icindeki 12 byte'i Zybo'ya normal konum cercevesiyle iletir (Zybo degismez). */
+#define RELAY_TYPE_POS                              0xE1
+#define RELAY_POS_HDR                               5
+#define RELAY_POS_LEN                               (RELAY_POS_HDR + 12)   /* = 17 */
+/* Gateway -> Zybo aktarilmis konum cercevesi (GW_FORWARD_RELAY_INFO=1):
+   [AA 55 13][17 B 0xE1 paketi][RSSI][SNR][CRC8] = 23 byte */
+#define GW_RELAY_FRAME_LEN_FIELD                    (RELAY_POS_LEN + 2)    /* = 19 = 0x13 */
+/* Bu kadar suredir Zybo tablosunda kendini gormeyen node "ulasamiyorum" der (2 tablo + pay) */
+#define REACH_TIMEOUT_MS                            25000
+/* Aktarim oncesi rastgele bekleme: ayni paketi baska komsu aktarirsa iptal edilir */
+#define POS_RELAY_DELAY_MIN_MS                      100
+#define POS_RELAY_DELAY_RAND_MS                     500
+
+/* 0xE2 AKTARILMIS UPLINK KONTROL: komsu -> gateway (musterinin 0xC1/0xC2/0xC5'i)
+   [0]=0xE2 [1..2]=aktaran [3]=aktaranin duydugu RSSI (i8) [4]=SNR (i8) [5..19]=orijinal 15 B
+   Gateway icini acip dogrudan gelmis gibi isler (Zybo degismez). */
+#define RELAY_TYPE_UL_CTRL                          0xE2
+#define RELAY_UL_HDR                                5
+#define RELAY_UL_LEN                                (RELAY_UL_HDR + CMD_PACKET_LEN)   /* = 20 */
+/* 0xE3 AKTARILMIS DOWNLINK: komsu -> uzak node (gateway'in 0xD1 tablo / 0xC1 / 0xC3'u)
+   [0]=0xE3 [1..2]=aktaran [3..]=orijinal paket (degistirilmeden)
+   Sadece aktarim modundaki (admin'e dogrudan ulasamayan) node'lar acar. */
+#define RELAY_TYPE_DL                               0xE3
+#define RELAY_DL_HDR                                3
+/* "Musteri": bizden aktarim isteyen node. Son bayrakli paketinden bu kadar sonra musteri sayilmaz */
+#define RELAY_CLIENT_TIMEOUT_MS                     30000
+#define MAX_RELAY_CLIENTS                           4
+#define DL_RELAY_DELAY_MIN_MS                       50
+#define DL_RELAY_DELAY_RAND_MS                      250
+/* Aktarici: ayni admin komutu bu kadar sure sonra yine duyulursa (Zybo ayni msg_id ile
+   yeniden denedi) musterilere asagi yeniden aktarilir */
+#define DL_CMD_RETRY_GAP_MS                         3000
+
+/* ======================= JOIN v1: takimli kimlik =======================
+   Adres semasi: UID'den turetilen adresler bit15 = 0 (0x0001..0x7FFF).
+   Katilan cihaz: 0x8000 | (takim << 8) | numara  (ALPHA-2 = 0x8102, ZULU-99 = 0x9A63).
+   0xFF00 | takim ileride takim adresleri icin ayrilmis, hic verilmez.
+   Takimlar NATO alfabesi: 1 = ALPHA ... 26 = ZULU. Numara 1..99. */
+#define ADDR_JOINED_FLAG                            0x8000
+#define JOIN_ADDR(team, num)                        ((uint16_t)(ADDR_JOINED_FLAG | ((uint16_t)(team) << 8) | (num)))
+#define JOIN_TEAM_MAX                               26
+#define JOIN_NUM_MAX                                99
+/* 0xA1 KATILMA ISTEGI: node -> gateway -> Zybo (17 B; gateway Zybo'ya LEN 0x13 ile iletir)
+   [0]=A1 [1..2]=src 0x0000 [3..4]=dst 0xFFFE [5]=req_seq [6..9]=dev_id (UID CRC32)
+   [10]=takim [11]=numara (0 = bos olan herhangi biri) [12..13]=PIN [14]=fw ana [15]=fw alt
+   [16]=pil % (0xFF = bilinmiyor). Tekrar eleme (dev_id, req_seq) ile. */
+#define JOIN_TYPE_REQ                               0xA1
+#define JOIN_REQ_LEN                                17
+/* 0xA2 KATILMA CEVABI: Zybo -> gateway (3x yayin) -> node (15 B)
+   [0]=A2 [1..2]=0xFFFE [3..4]=0xFFFF [5]=msg_id [6..9]=dev_id [10..11]=verilen adres
+   [12]=takim [13]=numara (sonuc 4 ise Zybo'nun onerdigi bos numara) [14]=sonuc */
+#define JOIN_TYPE_ANS                               0xA2
+#define JOIN_ANS_LEN                                15
+#define JOIN_RES_OK                                 0
+#define JOIN_RES_WRONG_PIN                          1
+#define JOIN_RES_REJECTED                           2
+#define JOIN_RES_TEAM_FULL                          3
+#define JOIN_RES_NUM_TAKEN                          4
+#define JOIN_RES_KICKED                             5      /* sadece telefona (0xCB): admin takimdan cikardi */
+#define JOIN_RES_LEFT                               6      /* sadece telefona (0xCB): takimdan ayrildi */
+/* 0xA3 KICK: Zybo -> gateway (3x yayin) -> node (15 B)
+   [0]=A3 [1..2]=0xFFFE [3..4]=dst (node'un adresi) [5]=msg_id [6..9]=dev_id [10]=sebep [11..14]=0
+   sebep 1: admin cikardi -> node mevcut adresinden ULASTI (0xC5) yollar, sonra kimligi siler.
+            Zybo ULASTI gelene kadar 5 sn arayla en fazla 3 kez yollar.
+   sebep 2: node'un kendi LEAVE'ine (0xA4) cevap, ACK yok. */
+#define JOIN_TYPE_KICK                              0xA3
+#define KICK_REASON_ADMIN                           1
+#define KICK_REASON_LEAVE_OK                        2
+/* 0xA4 LEAVE: node -> gateway -> SADECE Zybo (15 B, gateway LEN 0x11 ile iletir)
+   [0]=A4 [1..2]=src (node'un adresi) [3..4]=0xFFFE [5]=msg_id (denemelerde ayni) [6..9]=dev_id
+   [10..14]=0. 5 sn arayla en fazla 3 kez; A3 sebep 2 gelince ya da denemeler bitince kimlik silinir. */
+#define JOIN_TYPE_LEAVE                             0xA4
+#define LEAVE_TRIES                                 3
+#define LEAVE_RETRY_MS                              5000
+/* A1 tekrar araligi */
+#define JOIN_PERIOD_MS                              10000
+#define JOIN_PERIOD_RAND_MS                         5000
+/* Telefon <-> node yerel paketler (LoRa'ya cikmaz) */
+#define CMD_TYPE_JOIN_PARAMS                        0xC9   /* tel->node 15 B: [1]=takim [2]=numara [3..4]=PIN */
+#define CMD_TYPE_LEAVE                              0xCC   /* tel->node 15 B: takimdan ayril (node 0xA4 yollar) */
+#define CMD_TYPE_JOIN_STATUS                        0xCB   /* node->tel 8 B, asagida */
+#define JOIN_STATUS_LEN                             8
+/* 0xCB: [1]=durum [2]=son sonuc [3..4]=adres [5]=takim [6]=numara (sonuc 4: onerilen) [7]=req_seq */
+#define JOIN_ST_DISABLED                            0      /* JOIN_ENABLED=0: UID adresi */
+#define JOIN_ST_NEED_PARAMS                         1      /* kimlik yok, telefondan takim/PIN bekleniyor */
+#define JOIN_ST_WAITING                             2      /* A1 yollaniyor, admin onayi bekleniyor */
+#define JOIN_ST_JOINED                              3      /* kimlik var, normal calisma */
+#define JOIN_ST_FAILED                              4      /* reddedildi; sebep [2]'de */
+#define JOIN_ST_LEAVING                             5      /* 0xA4 yollaniyor, Zybo cevabi bekleniyor */
+/* Kimlik kaydi: flash'in son 2 KB sayfasi (linker'da kod alanindan cikarildi) */
+#define ID_FLASH_ADDR                               0x0803F800U
+#define ID_FLASH_PAGE                               127U
+#define ID_MAGIC                                    0x4E494F4AU   /* "JOIN" */
+
+/* ---------------- Faz 1 guvenlik (SECURE_ENABLED) ----------------
+   Havadaki her paket: [0]=0x51 [1..4]=dev_id (u32 LE, UID'nin CRC32'si; Zybo 0xFFFFFFFE)
+   [5..8]=sayac (u32 LE, gonderenin) [9..N+8]=sifreli ic paket (bugunku paket, degismeden)
+   [N+9..N+12]=MIC. AES-128-CCM, MIC 4 B.
+   nonce (13) = dev_id(4) | sayac(4) | dir(1) | 00 00 00 00   dir: 0 = node yollar, 1 = Zybo yollar
+   AAD = [0..8]. Alici once MIC'e, sonra sayaca bakar (32'lik pencere, dev_id basina).
+   Aktarim (ic ice): E1/E2 = [E1|E2][aktaran u16][RSSI][SNR][uzak node'un guvenli paketi, AYNEN]
+                     E3    = [E3][aktaran u16][Zybo'nun guvenli paketi, AYNEN]
+   Gateway -> Zybo: AA 55 LEN [havadaki guvenli paket] RSSI SNR CRC8   (LEN = boy + 2)
+   Zybo -> gateway: AA 55 LEN [tx_repeat][guvenli paket] CRC8          (LEN = 1 + boy) */
+#define SEC_VER                                     0x51
+#define SEC_HDR_LEN                                 9
+#define SEC_MIC_LEN                                 4
+#define SEC_OVERHEAD                                (SEC_HDR_LEN + SEC_MIC_LEN)   /* = 13 */
+#define SEC_DEVID_ZYBO                              0xFFFFFFFEU
+#define SEC_DIR_NODE                                0x00
+#define SEC_DIR_ZYBO                                0x01
+#define SEC_PIPE_MIN_LEN                            25     /* gateway: 0x51 ile baslayan, en az bu boyda = guvenli */
+#define SEC_WIN                                     32     /* tekrar penceresi (sayac) */
+#define SEC_REPLAY_SIZE                             16     /* takip edilen gonderen sayisi */
+#define SEC_CTR_STEP                                256    /* sayac her 256 pakette flash'a yazilir, acilista +256 */
+#define SEC_CTR_FLASH_ADDR                          0x0803F000U   /* sondan bir onceki 2 KB sayfa */
+#define SEC_CTR_PAGE                                126U
+#define SEC_CTR_SLOTS                               256    /* 8 B'lik yuva: [sayac][~sayac], sayfa dolunca silinir */
+#define SEC_TXQ_SIZE                                4      /* gateway: Zybo'dan gelen guvenli paket kuyrugu */
+#define SEC_TX_REPEAT_MAX                           5
 #define CMD_PACKET_LEN                              15
 #define CMD_DST_ALL                                 0xFFFF
 #define CMD_RELAY_COUNT                             3      /* gateway her komutu kac kez yayinlar */

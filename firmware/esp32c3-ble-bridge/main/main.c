@@ -34,6 +34,12 @@
 #define CMD_TYPE             0xC1       /* Faz 2: isaret / komut paketi (cmd_packet_t) */
 #define CMD_TYPE_DEL_REQ     0xC2       /* silme istegi (telefon -> admin) */
 #define CMD_TYPE_DEL_ACK     0xC3       /* admin karari (admin -> herkes) */
+#define CMD_TYPE_SET_POS     0xC4       /* telefonun konumu -> SADECE bagli node (LoRa'ya cikmaz) */
+#define CMD_TYPE_ACK         0xC5       /* telefon: admin komutu OKUNDU -> node -> admin */
+#define CMD_TYPE_NODE_STATUS 0xC6       /* node -> telefon: tabloda var miyim (dolayli onay) */
+#define CMD_TYPE_JOIN_PARAMS 0xC9       /* telefon -> node: takim / numara / PIN (katilma) */
+#define CMD_TYPE_LEAVE       0xCC       /* telefon -> node: takimdan ayril (node admin'e 0xA4 yollar) */
+#define CMD_TYPE_JOIN_STATUS 0xCB       /* node -> telefon: katilma durumu (8 B) */
 #define CMD_PACKET_LEN       15
 static const char *BRIDGE_TAG = "BRIDGE";
 static void phone_to_node(const uint8_t *p, uint16_t len);
@@ -442,7 +448,9 @@ static uint8_t crc8_update(uint8_t crc, uint8_t b)
    UART1 TX (GPIO5) -> NUCLEO D0 (PB7) uzerinden node'a yolla */
 static void phone_to_node(const uint8_t *p, uint16_t len)
 {
-    if (len != CMD_PACKET_LEN || (p[0] != CMD_TYPE && p[0] != CMD_TYPE_DEL_REQ)) {
+    if (len != CMD_PACKET_LEN ||
+        (p[0] != CMD_TYPE && p[0] != CMD_TYPE_DEL_REQ && p[0] != CMD_TYPE_SET_POS &&
+         p[0] != CMD_TYPE_ACK && p[0] != CMD_TYPE_JOIN_PARAMS && p[0] != CMD_TYPE_LEAVE)) {
         ESP_LOGW(BRIDGE_TAG, "telefondan tanimsiz yazma: %u byte, tip=0x%02X",
                  len, len ? p[0] : 0);
         return;
@@ -461,6 +469,15 @@ static void phone_to_node(const uint8_t *p, uint16_t len)
     if (p[0] == CMD_TYPE) {
         ESP_LOGI(BRIDGE_TAG, "KOMUT telefon -> node: dst=0x%04X id=%u tur=%u",
                  (unsigned)(p[3] | (p[4] << 8)), p[5], p[6]);
+    } else if (p[0] == CMD_TYPE_SET_POS) {
+        ESP_LOGI(BRIDGE_TAG, "KONUM telefon -> node: %s", p[9] == 1 ? "ayarla" : "kapat");
+    } else if (p[0] == CMD_TYPE_JOIN_PARAMS) {
+        ESP_LOGI(BRIDGE_TAG, "KATILMA telefon -> node: takim=%u numara=%u", p[1], p[2]);
+    } else if (p[0] == CMD_TYPE_LEAVE) {
+        ESP_LOGI(BRIDGE_TAG, "TAKIMDAN AYRIL telefon -> node");
+    } else if (p[0] == CMD_TYPE_ACK) {
+        ESP_LOGI(BRIDGE_TAG, "OKUNDU telefon -> node: komut 0x%04X/%u",
+                 (unsigned)(p[7] | (p[8] << 8)), p[9]);
     } else {
         ESP_LOGI(BRIDGE_TAG, "SILME ISTEGI telefon -> node: id=%u hedef=0x%04X/%u",
                  p[5], (unsigned)(p[7] | (p[8] << 8)), p[9]);
@@ -527,6 +544,12 @@ static void on_node_frame(const uint8_t *payload, uint16_t len)
         ESP_LOGI(BRIDGE_TAG, "KOMUT agdan -> telefon: src=0x%04X dst=0x%04X id=%u tur=%u",
                  (unsigned)(payload[1] | (payload[2] << 8)),
                  (unsigned)(payload[3] | (payload[4] << 8)), payload[5], payload[6]);
+    } else if (len == 8 && payload[0] == CMD_TYPE_NODE_STATUS) {
+        ESP_LOGI(BRIDGE_TAG, "NODE DURUMU -> telefon: tabloda %s (seq %u, son yollanan %u)",
+                 payload[4] ? "var" : "YOK", payload[5], payload[3]);
+    } else if (len == 8 && payload[0] == CMD_TYPE_JOIN_STATUS) {
+        ESP_LOGI(BRIDGE_TAG, "KATILMA DURUMU -> telefon: durum=%u sonuc=%u adres=0x%04X",
+                 payload[1], payload[2], (unsigned)(payload[3] | (payload[4] << 8)));
     } else {
         ESP_LOGI(BRIDGE_TAG, "cerceve: %u byte, tip=0x%02X", len, len ? payload[0] : 0);
     }

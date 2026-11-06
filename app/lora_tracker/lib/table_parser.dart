@@ -8,6 +8,8 @@
 
 import 'dart:typed_data';
 
+import 'teams.dart';
+
 const int tableType = 0xD1;
 const int recordSize = 12;
 
@@ -33,6 +35,9 @@ class NodeRecord {
   /// "0x157C" seklinde adres
   String get addrHex =>
       '0x${addr.toRadixString(16).toUpperCase().padLeft(4, '0')}';
+
+  /// Ekranda gosterilen isim: ALPHA-2 (takimli) ya da 0x157C (UID)
+  String get name => nodeName(addr);
 
   /// Yuvarlama hatasi olmadan "41.0101060" seklinde koordinat
   static String formatE7(int v) {

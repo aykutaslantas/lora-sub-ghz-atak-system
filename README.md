@@ -1,101 +1,70 @@
 # LoRa Sub-GHz Takip Sistemi (internetsiz, ATAK benzeri)
 
-> **Durum:** Geliştirme / prototip (Ekim 2026) · EMPA Elektronik stajında, mentör liderliğinde 4 kişilik ekip projesi
-> **Benim payım:** STM32WL node + gateway firmware'i, ESP32-C3 BLE köprüsü, Flutter mobil uygulama
+Sahada birbirini göremeyen kişilerin **internet ve hücresel şebeke olmadan** birbirinin konumunu görebildiği, haritaya işaret koyup komut alabildiği bir takip sistemi. Her kişi bir **LoRa node** ve telefon taşır; konumlar 869 MHz'te bir **gateway**'e gider, **Zybo Z7-20** üzerindeki admin istasyonu paketleri donanımda (FPGA) doğrulayıp "kim nerede" tablosunu herkese geri yayınlar.
 
-Sahada birbirini göremeyen kişilerin **internet ve hücresel şebeke olmadan** birbirinin konumunu görebildiği, haritaya işaret koyup komut gönderebildiği bir "kendi AirTag'imiz" sistemi. Her kişi bir **LoRa node** taşır; konumlar 868 MHz bandında bir **gateway**'e gider, **Zybo Z7-20** üzerindeki admin istasyonu donanımda (FPGA) filtreleyip "kim nerede" tablosunu herkese geri yayınlar. Kişiler kendi telefonlarında ATAK benzeri bir haritada herkesi görür.
-
-![Sistem fotoğrafı](docs/images/system-overview.jpg)
-<!-- TODO: masadaki kurulumun fotoğrafı (2 node + gateway + Zybo + telefon) -->
-
----
+> **Durum:** Çalışan prototip (Kasım 2026, firmware V1.16.0). Mentör liderliğinde 4 kişilik ekip projesi.
+> **Benim payım:** STM32WL node + gateway firmware'i, ESP32 BLE köprüsü, Flutter mobil uygulama, protokol tasarımı.
 
 ## Mimari
 
 ```mermaid
 flowchart LR
     subgraph Saha["Sahadaki her kişi"]
-        P["📱 Telefon<br/>Flutter uygulaması"] <-- "BLE<br/>(notify / write)" --> E["ESP32-C3<br/>BLE köprüsü"]
-        E <-- "UART 115200<br/>AA 55 çerçeve" --> N["STM32WL55<br/>LoRa node"]
+        P["Telefon<br/>Flutter (Android / iOS)"] <-- "BLE" --> E["ESP32-C3 / S3<br/>BLE köprüsü"]
+        E <-- "UART 115200<br/>AA 55 çerçeve" --> N["STM32WL<br/>LoRa node"]
     end
-    N <-- "LoRa 869.525 MHz<br/>SF7 / BW125" --> G["STM32WL55<br/>Gateway"]
-    G <-- "UART<br/>AA 55 çerçeve + CRC8" --> Z
-    subgraph Z["Zybo Z7-20 (admin istasyonu)"]
-        PL["PL: UART RX + parser<br/>BRAM whitelist filtresi<br/>konum tablosu, downlink TX"] --> PS["PS: PetaLinux<br/>admin GUI (HDMI)"]
+    N <-- "LoRa 869.525 MHz<br/>AES-128-CCM" --> G["STM32WL<br/>Gateway"]
+    N <-. "tek sekme mesh" .-> N2["Komşu node"]
+    G <-- "UART" --> Z
+    subgraph Z["Zybo Z7-20 (admin)"]
+        PL["PL: UART, AES, whitelist,<br/>konum tablosu, downlink"] --> PS["PS: PetaLinux + admin GUI"]
     end
 ```
 
-**Veri akışı:**
+1. Node 5–6 sn'de bir konumunu (telefonun GPS'i) yayınlar; gateway paketi açmadan Zybo'ya iletir.
+2. Zybo paketi doğrular, whitelist'e bakar, tabloyu günceller ve 10 sn'de bir **konum tablosunu** herkese yollar.
+3. Telefonlar tabloyu haritada gösterir; işaret ve komutlar Zybo üzerinden herkese dağıtılır.
 
-1. **Uplink (konum):** Node her ~5 s'de (± rastgele jitter) 12 baytlık konum paketi yayınlar → gateway paketi RSSI/SNR ekleyerek UART ile Zybo'ya iletir.
-2. **Filtre:** Zybo'nun PL tarafı, gelen her paketin adresini BRAM'deki **whitelist** ile karşılaştırır; tanınmayan node'lar Linux'a hiç ulaşmaz.
-3. **Downlink (tablo):** Zybo "kim nerede" tablosunu (0xD1) gateway'e yollar, gateway LoRa ile herkese yayınlar → her node tabloyu ESP32 üzerinden telefonuna iletir.
-4. **Komutlar:** Telefondan konulan işaret/komut (0xC1) node → gateway yoluyla 3 kez tekrar yayınlanır, istenirse Zybo'ya da bildirilir. Silme istekleri (0xC2) yalnızca admin'e gider, admin kararı (0xC3) herkese yayınlanır.
+Ayrıntılar: [docs/architecture.md](docs/architecture.md) · [docs/protocol.md](docs/protocol.md) · [docs/bring-up-and-testing.md](docs/bring-up-and-testing.md)
 
-Ayrıntılar: [docs/architecture.md](docs/architecture.md) · [docs/protocol.md](docs/protocol.md)
+## Öne çıkanlar
 
----
+- **Tek firmware, iki rol:** Aynı STM32 kodu `app_mode.h`'taki bayraklarla node ya da gateway olarak derlenir.
+- **Takımlı kimlik (JOIN):** Node telefondan takım/numara/PIN ile katılır, admin onaylar; adres (ör. `ALPHA-2 = 0x8102`) flash'ta saklanır. Admin node'u takımdan atabilir, node kendisi ayrılabilir.
+- **Onaylı komutlar:** Admin komutlarına iki aşamalı ACK (ULAŞTI / OKUNDU); kayıp ve çakışmaya karşı tekrar ve tekrar eleme.
+- **Tek sekme mesh:** Gateway'i duymayan node "beni aktarın" der, komşusu konumunu ve komutlarını iki yönde taşır.
+- **Güvenlik (Faz 1):** Havadaki her paket AES-128-CCM ile şifreli ve imzalı (4 B MIC); sayaç + 32'lik pencereyle replay koruması, sayaç flash'ta yıpratmadan saklanır.
+- **Donanımda filtre:** Whitelist ve doğrulama Zybo'nun PL tarafında; tanınmayan paket Linux'a ulaşmaz.
+- **Tamamen offline:** Harita `.mbtiles` dosyasından çizilir.
+- **PC'de test:** Firmware mantığı sahte HAL/radyo ile PC'de test edilir (`firmware/stm32wl-node-gateway/tests`).
 
 ## Repo yapısı
 
-| Klasör | İçerik | Teknoloji |
-|---|---|---|
-| [`firmware/stm32wl-node-gateway/`](firmware/stm32wl-node-gateway) | Node ve gateway için **tek** firmware; mod derleme bayraklarıyla seçilir | C, STM32CubeIDE, STM32WL SubGHz_Phy |
-| [`firmware/esp32c3-ble-bridge/`](firmware/esp32c3-ble-bridge) | Node UART'ı ↔ BLE GATT köprüsü | C, ESP-IDF, NimBLE |
-| [`app/lora_tracker/`](app/lora_tracker) | ATAK benzeri, yatay ekranlı offline harita uygulaması | Flutter / Dart |
-| [`docs/`](docs) | Mimari, protokol, modül dokümanları, test notları | Markdown + Mermaid |
+| Klasör | İçerik |
+|---|---|
+| [`firmware/stm32wl-node-gateway/`](firmware/stm32wl-node-gateway) | STM32WL node/gateway firmware'i (C, STM32CubeIDE) ve PC testleri |
+| [`firmware/esp32c3-ble-bridge/`](firmware/esp32c3-ble-bridge) | Node UART'ı ↔ BLE köprüsü (ESP-IDF, NimBLE; C3 ve S3) |
+| [`app/lora_tracker/`](app/lora_tracker) | Flutter harita uygulaması (Android, iOS) |
+| [`docs/`](docs) | Mimari, protokol, test notları |
 
-Zybo PL (FPGA) tasarımı ve admin GUI ekip arkadaşlarıma ait olduğu için bu repoda yok; arayüzleri [docs/protocol.md](docs/protocol.md) içinde tanımlı.
-
----
-
-## Öne çıkan teknik noktalar
-
-- **Tek kod tabanı, üç rol:** Aynı STM32 firmware'i `app_mode.h` içindeki bayraklarla node, gateway veya Zybo'suz test gateway'i olarak derlenir.
-- **Donanım UID'sinden adres:** Node adresi, çipin 96-bit benzersiz kimliğinden 16 bit'e katlanarak üretilir; aynı binary her karta yüklenebilir. Ayrılmış adres aralıkları (0x0000 telefon, 0xFFFE admin, 0xFFFF herkes) korunur.
-- **Kendi çerçeveleme protokolü:** Tüm UART bağlantılarında `AA 55 | LEN | payload | CRC8 (poly 0x07)`; byte byte çalışan durum makinesiyle senkron kaybından toparlanma.
-- **Çakışma ve tekrar yönetimi:** TX zamanlayıcısına rastgele jitter, gateway'de 3× tekrar yayın, `(src, msg_id)` halka tamponuyla tekrar eleme, seq numarasıyla kayıp paket sayımı.
-- **Düşük güç:** Node, köprü kapalıyken STOP2 uyku modunda çalışır; USART1 STOP2'de çalışmadığı için köprü/gateway modlarında uyku otomatik kapatılır.
-- **Regülasyona uygun bant:** 869.4–869.65 MHz alt bandı (500 mW e.r.p., %10 duty cycle).
-- **Tamamen offline harita:** Uygulama `.mbtiles` dosyasından harita çizer, konumu telefonun kendi GPS'inden alır; internet gerekmez.
-- **Donanım değişikliğine hazırlık:** NUCLEO-WL55JC1'den Quectel KG200Z modülüne geçiş; RF switch, TCXO ve PA (LP/HP) ayarları kart bazında doğrulandı.
-
----
+Zybo PL tasarımı ve admin GUI ekip arkadaşıma ait olduğu için bu repoda yok; arayüzleri [docs/protocol.md](docs/protocol.md) içinde.
 
 ## Donanım
 
 | Rol | Kart |
 |---|---|
-| Node / Gateway | ST NUCLEO-WL55JC1, Quectel KG200Z (STM32WLE5) |
-| BLE köprüsü | ESP32-C3-DevKitM-1 |
-| Admin istasyonu | Digilent Zybo Z7-20 (Zynq-7020) |
-| Telefon | Android (iOS projesi de mevcut) |
-
----
+| Node / gateway | NUCLEO-WL55JC1, Quectel KG200Z (STM32WLE5) |
+| BLE köprüsü | ESP32-C3-DevKitM-1, ESP32-S3 |
+| Admin | Digilent Zybo Z7-20 (Zynq-7020) |
+| Telefon | Android, iPhone |
 
 ## Hızlı başlangıç
 
-1. **Firmware:** `firmware/stm32wl-node-gateway` → [README](firmware/stm32wl-node-gateway/README.md). `app_mode.h` ile rolü seç, STM32CubeIDE'de derle ve ST-LINK ile yükle.
-2. **BLE köprüsü:** `firmware/esp32c3-ble-bridge` → `idf.py set-target esp32c3 build flash monitor`.
-3. **Uygulama:** `app/lora_tracker` → offline harita dosyasını `assets/map.mbtiles` olarak ekle, `flutter run`.
+1. **Firmware:** [firmware/stm32wl-node-gateway/README.md](firmware/stm32wl-node-gateway/README.md). `net_key.example.h` → `net_key.h`, `app_mode.h` ile rolü seç, STM32CubeIDE'de derle.
+2. **BLE köprüsü:** `idf.py set-target esp32c3` (ya da `esp32s3`) → `idf.py build flash monitor`.
+3. **Uygulama:** harita dosyasını `assets/map.mbtiles` olarak ekle → `flutter run`. iPhone için: [app/lora_tracker/README.md](app/lora_tracker/README.md).
 
-Test ve devreye alma notları: [docs/bring-up-and-testing.md](docs/bring-up-and-testing.md)
+## Ekip
 
----
-
-## Ekran görüntüleri
-
-| Uygulama: harita | Uygulama: işaret menüsü | Node log'u | Admin GUI |
-|---|---|---|---|
-| ![](docs/images/app-map.png) | ![](docs/images/app-radial-menu.png) | ![](docs/images/node-log.png) | ![](docs/images/admin-gui.png) |
-
-<!-- Görselleri docs/images/ klasörüne bu isimlerle ekle; liste için docs/images/README.md -->
-
----
-
-## Ekip ve katkı
-
-Mentör liderliğinde 4 kişilik ekip projesi.
-
-- **Aykut İsmet Aslantaş:** STM32WL node/gateway firmware'i, UART çerçeve protokolü, ESP32-C3 BLE köprüsü, Flutter mobil uygulama
-- **Ekip arkadaşları:** Zybo PL tasarımı (UART RX, parser, BRAM whitelist, konum tablosu, downlink TX), PetaLinux ve admin GUI
+- **Aykut İsmet Aslantaş:** STM32WL firmware, protokol (JOIN, ACK, mesh, güvenlik), ESP32 köprüsü, Flutter uygulaması
+- **Ekip arkadaşları:** Zybo PL tasarımı (UART, AES çekirdeği, whitelist, tablo), PetaLinux ve admin GUI

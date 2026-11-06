@@ -1,0 +1,50 @@
+# Flutter uygulamasini iPhone icin IMZASIZ derler ve .ipa'yi indirilebilir artifact olarak yukler.
+# Telefona yukleme: Sideloadly + ucretsiz Apple ID (bkz. app/lora_tracker/README.md).
+# Sadece elle calisir (Actions -> iOS unsigned IPA -> Run workflow): private repoda macOS dakikasi pahali.
+name: iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: app/lora_tracker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          # Surum uyusmazligi olursa yereldeki `flutter --version` degerini sabitleyin:
+          #   flutter-version: 3.xx.x
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Build iOS (release, no codesign)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          rm -rf Payload lora_tracker-unsigned.ipa
+          mkdir Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry lora_tracker-unsigned.ipa Payload
+          ls -lh lora_tracker-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lora_tracker-unsigned-ipa
+          path: app/lora_tracker/lora_tracker-unsigned.ipa
+          retention-days: 14

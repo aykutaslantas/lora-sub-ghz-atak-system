@@ -52,7 +52,7 @@ class FindPage extends StatelessWidget {
               return const Center(child: Text('Bu node artık tabloda yok'));
             }
             target = LatLng(n.lat, n.lon);
-            name = n.addrHex;
+            name = n.name;
             extra.add(n.hasFix ? 'Node konumu: GPS' : 'Node konumu: sahte (fix yok)');
             extra.add('seq ${n.seq}');
           }

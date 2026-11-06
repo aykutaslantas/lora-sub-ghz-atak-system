@@ -27,3 +27,9 @@ app/lora_tracker/assets/*.mbtiles
 app/lora_tracker/android/local.properties
 app/lora_tracker/android/.gradle/
 *.apk
+
+# Ag anahtari (git'e girmez; net_key.example.h'tan kopyalanir)
+firmware/stm32wl-node-gateway/SubGHz_Phy/App/net_key.h
+
+# PC testleri
+firmware/stm32wl-node-gateway/tests/build/

@@ -13,11 +13,13 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:latlong2/latlong.dart';
 
 import 'find_page.dart';
+import 'join_page.dart';
 import 'cmd_packet.dart';
 import 'location_service.dart';
 import 'marks.dart';
 import 'map_view.dart';
 import 'table_parser.dart';
+import 'teams.dart';
 
 const String kDeviceName = 'LoRaNode-BLE';
 final Guid kServiceUuid = Guid('abf0');
@@ -83,6 +85,26 @@ class _TrackerPageState extends State<TrackerPage> {
   bool _disposed = false;
   bool _goBackDialogOpen = false;
 
+  // ---- 0xC4: telefonun konumunu node'un konumu yap ----
+  bool _sharePos = false;
+  DateTime? _lastPosSent;
+  static const Duration kPosMinGap = Duration(seconds: 5); // en sik
+  static const Duration kPosRefresh = Duration(seconds: 15); // hareket yoksa da
+
+  // ---- Dolayli onay (0xC6): son konumum admin'e ulasti mi ----
+  NodeStatus? _nodeStatus;
+  DateTime? _nodeStatusTime;
+  // OKUNDU ACK'i yollanan komutlar (ayni komuta iki kez yollama)
+  final Set<String> _seenAcked = {};
+
+  // ---- JOIN v1 (0xCB): node'un takim kimligi ----
+  final ValueNotifier<JoinStatus?> _joinVN = ValueNotifier(null);
+  // Kullanicinin yolladigi ama node'un henuz almadigi parametreler
+  // (node o sirada yeniden baslarsa "parametre bekliyorum" der, tekrar yollariz)
+  ({int team, int num, int pin})? _pendingJoin;
+  bool _joinPageOpen = false;
+  bool _joinPromptShown = false;
+
   @override
   void initState() {
     super.initState();
@@ -97,6 +119,8 @@ class _TrackerPageState extends State<TrackerPage> {
       if (MarkStore.instance.expireGoBack(DateTime.now())) {
         _snack('ADMIN: geri dön hatırlatması bitti, hedef kaldırıldı');
       }
+      // Konum paylasimi acikken hareket olmasa da node'a tazele (node 60 sn'de birakir)
+      _maybeSendPos(refresh: true);
     });
     _adapterSub = FlutterBluePlus.adapterState.listen((s) {
       if (s == BluetoothAdapterState.on) {
@@ -110,6 +134,51 @@ class _TrackerPageState extends State<TrackerPage> {
     // Telefonun GPS'i. BLE izin penceresiyle cakismasin diye biraz sonra.
     Future<void>.delayed(
         const Duration(seconds: 2), LocationService.instance.start);
+    // Konum degisince (paylasim aciksa) node'a yolla
+    LocationService.instance.current.addListener(_onMyLocation);
+  }
+
+  // ---- 0xC4: konum paylasimi ----
+  void _onMyLocation() => _maybeSendPos();
+
+  /// Paylasim aciksa ve zamani geldiyse konumu node'a yolla.
+  ///  - konum degisti (listener): en fazla 5 sn'de bir
+  ///  - refresh (her saniyelik ticker): degismese de 15 sn'de bir
+  ///  - force: hemen (acildiginda / yeniden baglanildiginda)
+  Future<void> _maybeSendPos({bool force = false, bool refresh = false}) async {
+    if (!_sharePos || _state != LinkState.connected) return;
+    final me = LocationService.instance.current.value;
+    if (me == null) return;
+    final now = DateTime.now();
+    final last = _lastPosSent;
+    if (!force && last != null &&
+        now.difference(last) < (refresh ? kPosRefresh : kPosMinGap)) {
+      return;
+    }
+    _lastPosSent = now;
+    await _writeBle(encodeSetPos(me.point));
+  }
+
+  Future<void> _toggleSharePos() async {
+    if (_sharePos) {
+      _sharePos = false;
+      final ok = await _writeBle(encodeSetPos(null));
+      _snack(ok
+          ? 'Konum paylaşımı kapandı: node sahte konuma döndü'
+          : 'Konum paylaşımı kapandı (BLE bağlı değil, node 60 sn içinde kendisi bırakır)');
+    } else {
+      if (LocationService.instance.current.value == null) {
+        _snack('Önce konumun lazım: ${LocationService.instance.status.value}');
+        return;
+      }
+      _sharePos = true;
+      _lastPosSent = null;
+      await _maybeSendPos(force: true);
+      _snack(_state == LinkState.connected
+          ? 'Node artık bu telefonun konumunu yayınlıyor (fix=1)'
+          : 'Konum paylaşımı açık, BLE bağlanınca gönderilecek');
+    }
+    if (mounted) setState(() {});
   }
 
   void _openFind(NodeRecord n) {
@@ -211,17 +280,18 @@ class _TrackerPageState extends State<TrackerPage> {
     final (res, m) = MarkStore.instance.onNetwork(p,
         accept: (src) => src >= 0xFFF0 || _nodes.any((n) => n.addr == src));
     if (res == NetResult.rejected) {
-      debugPrint('Komut yok sayildi: ${CmdPacket.hex16(p.src)} tabloda yok');
+      debugPrint('Komut yok sayildi: ${nodeName(p.src)} tabloda yok');
       return;
     }
     if (m == null) return; // tekrar
     if (res == NetResult.confirmed) {
       _snack('✓✓ Ağa ulaştı: ${m.kind.label} → ${m.targetText} '
-          '(node ${CmdPacket.hex16(p.src)})');
+          '(node ${nodeName(p.src)})');
       return;
     }
-    // Baskasindan yeni isaret / komut
-    if (m.kind.isCommand && MarkStore.instance.isForMe(m)) {
+    // Baskasindan yeni isaret / komut. Admin'den gelen HER sey (isaret dahil) uyari
+    // penceresi acar: Tamam / Bul'a basilinca admin'e OKUNDU gider.
+    if ((m.kind.isCommand && MarkStore.instance.isForMe(m)) || m.src == addrAdmin) {
       _showCmdAlert(m);
     } else {
       _snack('${m.fromText}: ${m.kind.label}'
@@ -259,18 +329,140 @@ class _TrackerPageState extends State<TrackerPage> {
             'Haritadaki turuncu hedefe dön.$range'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Tamam')),
+              onPressed: () {
+                Navigator.pop(ctx);
+                _sendSeen(addrAdmin, g.msgId);
+              },
+              child: const Text('Tamam')),
           FilledButton.icon(
             icon: const Icon(Icons.navigation),
             label: const Text('Bul'),
             onPressed: () {
               Navigator.pop(ctx);
+              _sendSeen(addrAdmin, g.msgId);
               _openFindPoint('ADMIN: Bölgeye geri dön', g.point);
             },
           ),
         ],
       ),
     ).whenComplete(() => _goBackDialogOpen = false);
+  }
+
+  // ---- 0xC5 OKUNDU: kullanici admin komutunu gordu ----
+  Future<void> _sendSeen(int src, int msgId) async {
+    final key = '$src:$msgId';
+    if (_seenAcked.contains(key)) return;
+    final ok = await _writeBle(encodeSeenAck(targetSrc: src, targetMsgId: msgId));
+    if (ok) _seenAcked.add(key);
+  }
+
+  // ---- 0xC6: node durumu (son konumum admin'e ulasti mi) ----
+  void _onNodeStatus(NodeStatus s) {
+    MarkStore.instance.myNodeAddr = s.addr; // telefonun bagli oldugu node artik kesin
+    if (!mounted) return;
+    setState(() {
+      _nodeStatus = s;
+      _nodeStatusTime = DateTime.now();
+    });
+  }
+
+  // ---- JOIN v1: node'dan katilma durumu (0xCB) ----
+  void _onJoinStatus(JoinStatus s) {
+    final prev = _joinVN.value;
+    _joinVN.value = s;
+    switch (s.state) {
+      case JoinState.joined:
+        MarkStore.instance.myNodeAddr = s.addr;
+        _pendingJoin = null;
+        if (prev != null && prev.state != JoinState.joined) {
+          HapticFeedback.mediumImpact();
+          _snack('Admin onayladı: artık ${nodeName(s.addr)} olarak görünüyorsun');
+        }
+      case JoinState.failed:
+        _pendingJoin = null;
+        if (prev == null ||
+            prev.state != JoinState.failed ||
+            prev.reqSeq != s.reqSeq) {
+          _snack('Katılma reddedildi: ${s.resultText}');
+        }
+      case JoinState.needParams:
+        final wasMember = prev != null &&
+            (prev.state == JoinState.joined || prev.state == JoinState.leaving);
+        if (wasMember && s.result == 5) {
+          // Admin takimdan cikardi
+          _pendingJoin = null;
+          HapticFeedback.heavyImpact();
+          _showKickedAlert(prev!.addr);
+          break;
+        }
+        if (wasMember && s.result == 6) {
+          _pendingJoin = null;
+          _snack('Takımdan ayrıldın (${nodeName(prev!.addr)})');
+          break;
+        }
+        // Yolladigimiz parametreler node'a ulasmadiysa (node resetlendi vs.) tekrar yolla
+        final p = _pendingJoin;
+        if (p != null) {
+          _writeBle(encodeJoinParams(team: p.team, num: p.num, pin: p.pin));
+        } else if (!_joinPromptShown && !_joinPageOpen) {
+          // Kimliksiz node: katilma ekranini bir kez kendiliginden ac
+          _joinPromptShown = true;
+          _openJoin();
+        }
+      case JoinState.waiting:
+        _pendingJoin = null; // node aldi
+      case JoinState.leaving:
+        break;
+      case JoinState.disabled:
+        break;
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<bool> _sendJoin(int team, int num, int pin) async {
+    _pendingJoin = (team: team, num: num, pin: pin);
+    return _writeBle(encodeJoinParams(team: team, num: num, pin: pin));
+  }
+
+  Future<bool> _sendLeave() async {
+    _pendingJoin = null;
+    _joinPromptShown = true; // ayrilan kullanici zaten bu ekranda
+    return _writeBle(encodeLeave());
+  }
+
+  void _showKickedAlert(int oldAddr) {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.person_remove, color: Colors.redAccent, size: 40),
+        title: const Text('ADMIN seni takımdan çıkardı'),
+        content: Text('${nodeName(oldAddr)} kimliği silindi, node konum yayınlamıyor. '
+            'Tekrar katılmak için admin onayı gerekir.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Tamam')),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _openJoin();
+            },
+            child: const Text('Tekrar katıl'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openJoin() {
+    if (_joinPageOpen || !mounted) return;
+    _joinPageOpen = true;
+    Navigator.of(context)
+        .push(MaterialPageRoute<void>(
+          builder: (_) => JoinPage(
+              status: _joinVN, onJoin: _sendJoin, onLeave: _sendLeave),
+        ))
+        .whenComplete(() => _joinPageOpen = false);
   }
 
   void _showCmdAlert(MapMark m) {
@@ -288,12 +480,17 @@ class _TrackerPageState extends State<TrackerPage> {
             'Hedef: ${m.target == null ? 'Herkes' : 'Sen'} · ${m.timeText}$range'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Tamam')),
+              onPressed: () {
+                Navigator.pop(ctx);
+                if (m.src == addrAdmin && m.msgId != null) _sendSeen(addrAdmin, m.msgId!);
+              },
+              child: const Text('Tamam')),
           FilledButton.icon(
             icon: const Icon(Icons.navigation),
             label: const Text('Bul'),
             onPressed: () {
               Navigator.pop(ctx);
+              if (m.src == addrAdmin && m.msgId != null) _sendSeen(addrAdmin, m.msgId!);
               _openFindPoint('${m.fromText}: ${m.kind.label}', m.point);
             },
           ),
@@ -305,7 +502,9 @@ class _TrackerPageState extends State<TrackerPage> {
   @override
   void dispose() {
     _disposed = true;
+    LocationService.instance.current.removeListener(_onMyLocation);
     _nodesVN.dispose();
+    _joinVN.dispose();
     _ticker?.cancel();
     _retry?.cancel();
     _scanSub?.cancel();
@@ -427,6 +626,9 @@ class _TrackerPageState extends State<TrackerPage> {
       await chr.setNotifyValue(true);
       _setStatus(
           LinkState.connected, 'Bağlı · MTU $_mtu · tablo bekleniyor (~10 sn)');
+      // Konum paylasimi aciksa yeniden baglaninca hemen yolla
+      _lastPosSent = null;
+      _maybeSendPos(force: true);
     } catch (e) {
       _setStatus(LinkState.error, 'Bağlantı hatası: $e');
       try {
@@ -438,6 +640,20 @@ class _TrackerPageState extends State<TrackerPage> {
 
   // ---- 3) Gelen veri ----
   void _onData(List<int> data) {
+    // 8 byte 0xCB = katilma durumu (JOIN v1)
+    final js = JoinStatus.decode(data);
+    if (js != null) {
+      _lastHex = toHex(data);
+      _onJoinStatus(js);
+      return;
+    }
+    // 8 byte 0xC6 = node durumu (dolayli onay)
+    final st = NodeStatus.decode(data);
+    if (st != null) {
+      _lastHex = toHex(data);
+      _onNodeStatus(st);
+      return;
+    }
     // Silme: 15 byte 0xC3 = admin karari
     final dec = AdminDecision.decode(data);
     if (dec != null) {
@@ -538,6 +754,70 @@ class _TrackerPageState extends State<TrackerPage> {
     );
   }
 
+  // Dolayli onay gostergesi: son konumum admin'in tablosunda mi?
+  //  yesil  = var, en fazla 2 paket geride
+  //  turkuaz= var, ama komsu node uzerinden aktarimla (mesh)
+  //  sari   = var ama geride (paket kaybi)
+  //  kirmizi= tabloda yok (whitelist / menzil)
+  //  gri    = 30 sn'dir durum gelmedi (tablo gelmiyor)
+  Widget _adminAckChip(TextStyle small) {
+    final s = _nodeStatus;
+    final t = _nodeStatusTime;
+    if (s == null || t == null) {
+      return Text('Admin: —', style: small.copyWith(color: Colors.grey));
+    }
+    final age = DateTime.now().difference(t).inSeconds;
+    late final Color c;
+    late final String txt;
+    if (age > 30) {
+      c = Colors.grey;
+      txt = 'Admin: ? (${age}sn)';
+    } else if (!s.inTable) {
+      c = Colors.redAccent;
+      txt = 'Admin: yok';
+    } else if ((s.tableFlags & 0x04) != 0) {
+      // bit2: konumum admin'e komsu node uzerinden (mesh aktarimiyla) ulasiyor
+      c = Colors.cyanAccent;
+      txt = 'Admin ✓ aktarımla ${age}sn';
+    } else if (s.lag <= 2) {
+      c = Colors.lightGreenAccent;
+      txt = 'Admin ✓ ${age}sn';
+    } else {
+      c = Colors.amber;
+      txt = 'Admin ✓ ${s.lag} geride';
+    }
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      Icon(Icons.cell_tower, size: 16, color: c),
+      const SizedBox(width: 4),
+      Text(txt, style: small.copyWith(color: c)),
+    ]);
+  }
+
+  // Takim kimligi: ALPHA-2 (takim renginde) / KATIL / bekliyor / red.
+  // Basinca katilma ekrani acilir. JOIN kapali node'da gorunmez.
+  Widget _joinChip(TextStyle small) {
+    final s = _joinVN.value;
+    if (s == null || s.state == JoinState.disabled) {
+      return const SizedBox.shrink();
+    }
+    final (Color c, IconData ic, String txt) = switch (s.state) {
+      JoinState.joined => (teamColor(s.team), Icons.verified, nodeName(s.addr)),
+      JoinState.waiting => (Colors.amber, Icons.hourglass_top, 'Onay bekleniyor'),
+      JoinState.failed => (Colors.redAccent, Icons.error, 'Katılma reddedildi'),
+      JoinState.leaving => (Colors.amber, Icons.logout, 'Ayrılınıyor'),
+      _ => (Colors.orange, Icons.person_add, 'KATIL'),
+    };
+    return InkWell(
+      onTap: _openJoin,
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(ic, size: 16, color: c),
+        const SizedBox(width: 4),
+        Text(txt,
+            style: small.copyWith(color: c, fontWeight: FontWeight.bold)),
+      ]),
+    );
+  }
+
   // Ust ince durum cubugu (ATAK'taki gibi): BLE | GPS | node sayisi | saat | konum
   Widget _statusBar(ColorScheme cs, Color stateColor, bool stale) {
     String two(int v) => v.toString().padLeft(2, '0');
@@ -575,7 +855,21 @@ class _TrackerPageState extends State<TrackerPage> {
               style: small.copyWith(fontFamily: 'monospace'),
             ),
           ),
+          const SizedBox(width: 12),
+          _joinChip(small),
+          const SizedBox(width: 12),
+          _adminAckChip(small),
           const Spacer(),
+          // Konum paylasimi: acikken node bu telefonun konumunu yayinlar
+          IconButton(
+            icon: Icon(_sharePos ? Icons.share_location : Icons.location_disabled,
+                size: 18, color: _sharePos ? Colors.lightGreenAccent : Colors.grey),
+            tooltip: _sharePos
+                ? 'Node konumu = bu telefon (kapat)'
+                : 'Node konumu olarak bu telefonu kullan',
+            visualDensity: VisualDensity.compact,
+            onPressed: _toggleSharePos,
+          ),
           Text('${two(now.hour)}:${two(now.minute)}',
               style: small.copyWith(fontWeight: FontWeight.bold)),
           IconButton(

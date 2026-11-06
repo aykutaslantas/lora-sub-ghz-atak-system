@@ -37,6 +37,10 @@
 #include "app_version.h"
 #include "subghz_phy_version.h"
 #include "usart.h"   /* huart1: Zybo'ya giden USART1 (PB6 TX / PB7 RX) */
+#if (SECURE_ENABLED == 1) && (GATEWAY_MODE == 0)
+#include "lora_secure.h" /* AES-128 + CCM (header-only) */
+#include "net_key.h"     /* NET_KEY_BYTES: git'e eklenmez */
+#endif
 /* USER CODE END Includes */
 
 /* External variables ---------------------------------------------------------*/
@@ -59,6 +63,10 @@ typedef enum
   EV_DL_FRAME   = (1U << 6),   /* gateway: Zybo'dan gecerli downlink cercevesi geldi */
   EV_LOCAL_DL   = (1U << 7),   /* gateway (Zybo yok): yerel tabloyu yayinlama zamani */
   EV_CMD_RELAY  = (1U << 8),   /* gateway: komutun bir sonraki tekrarinin zamani */
+  EV_POS_RELAY  = (1U << 9),   /* node: aktarim kuyrugundaki bir paketin zamani geldi (mesh) */
+  EV_ACK        = (1U << 10),  /* node: bir ACK'in (ilk ya da tekrar) yollanma zamani geldi */
+  EV_JOIN       = (1U << 11),  /* node: katilma istegi (0xA1) / durum zamani geldi */
+  EV_SECTX      = (1U << 12),  /* gateway: Zybo'dan gelen guvenli paketin tekrar zamani */
 } AppEvent_t;
 
 /* Kayip paket takibi icin gorulen node tablosu */
@@ -81,6 +89,12 @@ typedef struct
 
 #if (VIRTUAL_NODES < 1) || (VIRTUAL_NODES > 8)
 #error "VIRTUAL_NODES 1..8 araliginda olmali"
+#endif
+#if (GATEWAY_MODE == 0) && (JOIN_ENABLED == 1) && ((VIRTUAL_NODES != 1) || (NODE_UART_BRIDGE != 1))
+#error "JOIN_ENABLED=1 icin VIRTUAL_NODES=1 ve NODE_UART_BRIDGE=1 olmali"
+#endif
+#if (GATEWAY_MODE == 1) && (SECURE_ENABLED == 1) && (GATEWAY_LOCAL_TABLE == 1)
+#error "SECURE_ENABLED=1 ile GATEWAY_LOCAL_TABLE=1 birlikte kullanilamaz (gateway anahtar tutmaz)"
 #endif
 /* LED yanik kalma suresi */
 #define LED_PULSE_MS                  50
@@ -141,6 +155,118 @@ static uint32_t rngState = 1;
 static uint8_t  cmdTxBuf[CMD_PACKET_LEN];   /* telefondan gelen, LoRa'ya yollanacak 0xC1 / 0xC2 */
 static bool     cmdTxPending = false;
 #endif
+#if (GATEWAY_MODE == 0) && (NODE_UART_BRIDGE == 1)
+/* Telefondan gelen gercek konum (0xC4). posOvrValid=false -> sahte konum */
+static bool     posOvrValid = false;
+static int32_t  posOvrLat = 0;
+static int32_t  posOvrLon = 0;
+static uint32_t posOvrTime = 0;             /* son 0xC4'un geldigi an (ms) */
+#endif
+/* ---- Tek sekme mesh ---- */
+#if (GATEWAY_MODE == 0)
+static uint32_t bootTime = 0;               /* acilis ani (ms) */
+/* Zybo tablosunda kendi kaydimizi DOGRUDAN ulasmis olarak (bit2 yok) son gordugumuz an.
+   Aktarimla ulasmis kayit (bit2 var) "dogrudan ulasiyorum" sayilmaz. */
+static uint32_t lastInTableTime = 0;
+static bool     everInTable = false;
+static uint32_t lastViaRelayTime = 0;       /* kaydimizi aktarimla ulasmis gordugumuz son an */
+static bool     relayReqLogged = false;     /* "aktarim isteniyor" durumu (log gecisleri icin) */
+/* Aktarim kuyrugu: 0xE1 (konum), 0xE2 (yukari kontrol), 0xE3 (asagi). Her slotun kendi
+   rastgele gecikme timer'i var; ayni paketi baska komsu once aktarirsa slot iptal edilir. */
+#define RELAY_Q_SIZE     3
+typedef struct
+{
+  uint8_t  buf[MAX_APP_BUFFER_SIZE];
+  uint8_t  len;
+  uint32_t key;
+  bool     active;
+  volatile bool due;
+  UTIL_TIMER_Object_t timer;
+} RelaySlot_t;
+static RelaySlot_t relayQ[RELAY_Q_SIZE];
+/* Aktardigimiz ya da baskasinin aktardigini duydugumuz paket anahtarlari */
+#define RELAY_SEEN_SIZE  24
+static uint32_t relaySeen[RELAY_SEEN_SIZE];
+static uint8_t  relaySeenIdx = 0;
+/* Bizden aktarim isteyen node'lar ("musteriler") */
+typedef struct
+{
+  uint16_t addr;
+  uint32_t lastSeen;
+} RelayClient_t;
+static RelayClient_t relayClients[MAX_RELAY_CLIENTS];
+/* Musterinin yukari aktardigimiz 0xC1'i: gateway'den donen kopyasini asagi aktaracagiz */
+static uint32_t echoWaitKey = 0;
+/* Su an islenen paket 0xE3'ten acildi (tekrar aktarilmaz) */
+static bool     rxViaRelay = false;
+/* Paket anahtari: [31]=1 [29..24]=etiket [23..0]=deger */
+#define RKEY(tag, v)     (0x80000000U | ((uint32_t)(tag) << 24) | ((uint32_t)(v) & 0x00FFFFFFU))
+#define RTAG_POS         0x01
+#define RTAG_UL(t)       (0x10U | CTRL_TAG(t))
+#define RTAG_DL(t)       (0x20U | CTRL_TAG(t))
+#define RTAG_TABLE       0x30
+#endif
+#if (GATEWAY_MODE == 1)
+/* Zybo'ya iletilen konumlar: ayni paket hem dogrudan hem aktarilmis gelirse bir kez ilet */
+#define POS_SEEN_SIZE    16
+static uint32_t posSeen[POS_SEEN_SIZE];
+static uint8_t  posSeenIdx = 0;
+#endif
+
+#if (GATEWAY_MODE == 0)
+/* Komut ACK'i (0xC5) kuyrugu: her slot bir ACK'i ACK_REPEAT kez yollar */
+typedef struct
+{
+  uint16_t me;            /* ACK'i yollayan adres (node / sanal node) */
+  uint16_t ackedSrc;      /* onaylanan komutun src'si */
+  uint8_t  ackedId;       /* onaylanan komutun msg_id'si */
+  uint8_t  kind;          /* ACK_KIND_DELIVERED / ACK_KIND_SEEN */
+  uint8_t  left;          /* kalan gonderim */
+  bool     active;
+  volatile bool due;
+  UTIL_TIMER_Object_t timer;
+} AckSlot_t;
+static AckSlot_t ackQ[ACK_Q_SIZE];
+static uint8_t  ackTxBuf[CMD_PACKET_LEN];
+static uint8_t  ackSeq = 0;
+/* Aktarici: asagi aktarilan admin komutlarinin son aktarim zamani (Zybo yeniden denerse) */
+#define DL_CMD_HIST      4
+static struct { uint32_t key; uint32_t t; } dlCmdHist[DL_CMD_HIST];
+static uint8_t  dlCmdHistIdx = 0;
+#endif
+/* ---- JOIN v1 ---- */
+#if (GATEWAY_MODE == 0)
+static uint32_t myDevId = 0;                /* UID'nin CRC32'si (A1 / A2 eslesmesi) */
+static uint16_t uidAddr = 0;                /* UID'den turetilen adres (kimlik yokken) */
+static uint8_t  joinState = JOIN_ST_DISABLED;
+static uint8_t  joinResult = 0;
+static uint8_t  joinTeam = 0;               /* istenen / verilen takim */
+static uint8_t  joinNum = 0;                /* istenen / verilen numara (sonuc 4: onerilen) */
+static uint16_t joinPin = 0;
+static uint8_t  joinReqSeq = 0;
+static volatile bool joinDue = false;
+static UTIL_TIMER_Object_t timerJoin;
+/* Kick / leave */
+static bool     kickPending = false;        /* atildik: ULASTI'lar bitince kimlik silinecek */
+static uint16_t kickedAddr = 0;             /* atildigimiz adres (gec gelen A3'e eski adresten ULASTI) */
+static uint8_t  leaveTries = 0;
+static uint8_t  leaveMsgId = 0;
+typedef struct
+{
+  uint32_t magic;
+  uint16_t addr;
+  uint8_t  team;
+  uint8_t  num;
+  uint32_t devId;
+  uint32_t chk;           /* ilk 12 byte'in CRC32'si */
+} IdRec_t;
+#endif
+#if (GATEWAY_MODE == 1)
+/* A1 tekrar eleme: (dev_id, req_seq) */
+#define JOIN_SEEN_SIZE   8
+static struct { uint32_t devId; uint8_t seq; bool used; } joinSeen[JOIN_SEEN_SIZE];
+static uint8_t  joinSeenIdx = 0;
+#endif
 static uint32_t cmdSeen[CMD_SEEN_SIZE];     /* gorulen (src,msg_id) anahtarlari, halka */
 static uint8_t  cmdSeenIdx = 0;
 #if (GATEWAY_MODE == 1)
@@ -159,6 +285,38 @@ typedef struct
   UTIL_TIMER_Object_t timer;
 } Relay_t;
 static Relay_t relays[RELAY_COUNT_BUF];
+#endif
+#if (SECURE_ENABLED == 1)
+#if (GATEWAY_MODE == 0)
+/* ---- Faz 1 guvenlik (node) ---- */
+static uint32_t secCtr = 1;                 /* bir sonraki paketin sayaci */
+static uint32_t secSaved = 0;               /* flash'a en son yazilan sayac */
+static uint16_t secSlot = 0;                /* sayac sayfasindaki bir sonraki bos yuva */
+static bool     secNeedErase = false;       /* sayfada bozuk yuva var: ilk yazmada silinecek */
+typedef struct { uint32_t devId; uint32_t last; uint32_t bits; uint32_t used; } SecPeer_t;
+static SecPeer_t secPeers[SEC_REPLAY_SIZE]; /* gonderen basina son sayac + 32'lik pencere */
+static uint32_t secUseTick = 0;
+static uint8_t  secRaw[MAX_APP_BUFFER_SIZE];/* son alinan guvenli paketin ham hali (aktarim icin) */
+static uint16_t secRawLen = 0;
+static bool     secRawValid = false;        /* true: son paket dogrudan guvenli (ic ice degil) */
+static uint8_t  secTxBuf[MAX_APP_BUFFER_SIZE];
+static uint8_t  secInner[MAX_APP_BUFFER_SIZE];
+static uint32_t secMicFail = 0, secReplayDrop = 0;
+#else
+/* ---- Faz 1 guvenlik (gateway): Zybo'dan gelen hazir guvenli paketler, tx_repeat kez ---- */
+typedef struct
+{
+  uint8_t  buf[MAX_APP_BUFFER_SIZE];
+  uint8_t  len;
+  uint8_t  left;          /* kalan yayin */
+  uint32_t seq;           /* eklenme sirasi (eski once) */
+  bool     active;
+  volatile bool due;
+  UTIL_TIMER_Object_t timer;
+} SecTx_t;
+static SecTx_t  secTxQ[SEC_TXQ_SIZE];
+static uint32_t secTxSeq = 0;
+#endif
 #endif
 
 #if UART1_PARSER_USED
@@ -219,6 +377,18 @@ static void OnRxError(void);
 /* USER CODE BEGIN PFP */
 static void Node_Process(void);
 static void RadioSend(const uint8_t *data, uint8_t len);
+#if (SECURE_ENABLED == 1) && (GATEWAY_MODE == 0)
+static void Sec_Init(void);
+static bool Sec_Incoming(void);
+static void AirSend(const uint8_t *data, uint8_t len);
+#else
+#define AirSend(d, l)   RadioSend((d), (l))
+#endif
+#if (SECURE_ENABLED == 1) && (GATEWAY_MODE == 1)
+static void SecTx_Add(const uint8_t *pkt, uint16_t len, uint8_t repeat);
+static bool SecTx_Service(void);
+static void OnSecTxTimer(void *context);
+#endif
 static void RadioRx(void);
 static void PostEvent(uint32_t ev);
 static void OnTxTimerEvent(void *context);
@@ -234,6 +404,53 @@ static uint8_t Crc8(const uint8_t *data, uint32_t len) __attribute__((unused));
 static uint8_t Crc8Update(uint8_t crc, uint8_t b) __attribute__((unused));
 static void Uart1_SendFrame(const uint8_t *payload, uint16_t len) __attribute__((unused));
 static void HandleCmdPacket(void);
+#if (GATEWAY_MODE == 0)
+static void Node_QueueAck(uint16_t me, uint16_t ackedSrc, uint8_t ackedId, uint8_t kind);
+static void OnAckTimer(void *context);
+static void RelaySeen_Forget(uint32_t key);
+static bool DlCmd_RetryDue(uint32_t key);
+static void DlCmd_Note(uint32_t key);
+static bool Node_NeedsRelay(void);
+static bool Node_CanRelay(void);
+static bool RelaySeen_Mark(uint32_t key);
+static void Relay_Enqueue(uint32_t key, uint8_t type, bool withLink, int16_t rssi, int8_t snr,
+                          const uint8_t *body, uint16_t bodyLen,
+                          uint32_t minMs, uint32_t randMs, const char *what);
+static void Relay_Cancel(uint32_t key, uint16_t byWhom);
+static void OnRelaySlotTimer(void *context);
+static uint32_t Hash24(const uint8_t *p, uint16_t n);
+static void Client_Touch(uint16_t addr);
+static bool Client_IsActive(uint16_t addr);
+static bool Client_AnyActive(void);
+static void HandleRelayedDl(void);
+#endif
+#if (GATEWAY_MODE == 1)
+static bool PosSeen_Mark(uint16_t addr, uint8_t seq);
+#if (GW_FORWARD_RELAY_INFO == 1)
+static void Gateway_ForwardRelayed(const uint8_t *relayPkt, int16_t rssi, int8_t snr);
+#endif
+#endif
+static void HandleRelayedPos(void);
+static void HandleRelayedUlCtrl(void);
+static uint32_t Crc32(const uint8_t *p, uint32_t n);
+#if (GATEWAY_MODE == 0)
+static void Join_Init(void);
+static void Join_SendStatus(void);
+static void Join_HandleAnswer(void);
+static void Join_Start(uint8_t team, uint8_t num, uint16_t pin);
+static void Join_Clear(uint8_t result);
+static void Join_Leave(void);
+static void Join_HandleKick(void);
+static bool Ack_Pending(uint16_t me);
+static void OnJoinTimer(void *context);
+static bool Id_Load(IdRec_t *r);
+static bool Id_Save(uint16_t addr, uint8_t team, uint8_t num);
+static void Id_Erase(void);
+#endif
+#if (GATEWAY_MODE == 1)
+static void Gateway_HandleJoinReq(void);
+static void Gateway_ForwardFrame(const uint8_t *payload, uint16_t len, int16_t rssi, int8_t snr, const char *what);
+#endif
 static bool Cmd_MarkSeen(uint8_t type, uint16_t src, uint8_t id);
 static void LogCmd(const char *tag, const uint8_t *p);
 #if UART1_PARSER_USED
@@ -265,7 +482,7 @@ void SubghzApp_Init(void)
   /* USER CODE BEGIN SubghzApp_Init_1 */
 
   APP_LOG(TS_OFF, VLEVEL_M, "\n\rP2P KONUM NODE\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "APPLICATION_VERSION: V%X.%X.%X\r\n",
+  APP_LOG(TS_OFF, VLEVEL_M, "APPLICATION_VERSION: V%u.%u.%u\r\n",
           (uint8_t)(APP_VERSION_MAIN),
           (uint8_t)(APP_VERSION_SUB1),
           (uint8_t)(APP_VERSION_SUB2));
@@ -281,6 +498,8 @@ void SubghzApp_Init(void)
   {
     uint32_t uid = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
     myAddr = (uint16_t)(uid ^ (uid >> 16));
+    /* bit15 = 1 araligi (0x8000+) JOIN ile verilen takim adreslerine ayrildi */
+    myAddr &= (uint16_t)~ADDR_JOINED_FLAG;
   }
 #endif
   /* Adres korumasi: 0x0000 (telefon) ve 0xFFF0-0xFFFF (herkes/admin/ayrilmis) hicbir
@@ -291,6 +510,13 @@ void SubghzApp_Init(void)
     myAddr = (uint16_t)(myAddr - 0x1000);   /* ornek: 0xFFF5 -> 0xEFF5 */
   }
   memset(peers, 0, sizeof(peers));
+#if (GATEWAY_MODE == 0)
+  /* JOIN: flash'ta gecerli kimlik varsa adres onunla degisir */
+  Join_Init();
+#if (SECURE_ENABLED == 1)
+  Sec_Init();   /* dev_id Join_Init'te hesaplandi */
+#endif
+#endif
 
   /* Sanal node adresleri: kartin adresi, +1, +2, ... (0 adresi atlanir) */
   for (uint32_t i = 0; i < VIRTUAL_NODES; i++)
@@ -308,12 +534,44 @@ void SubghzApp_Init(void)
   {
     UTIL_TIMER_Create(&timerTx[i], TX_PERIOD_MS, UTIL_TIMER_ONESHOT, OnTxTimerEvent, (void *)i);
   }
+#if (GATEWAY_MODE == 0)
+  /* Tek sekme mesh: komsu paketini rastgele gecikmeyle aktarma timer'i */
+  for (uint32_t i = 0; i < RELAY_Q_SIZE; i++)
+  {
+    UTIL_TIMER_Create(&relayQ[i].timer, POS_RELAY_DELAY_MIN_MS, UTIL_TIMER_ONESHOT, OnRelaySlotTimer, (void *)i);
+  }
+  for (uint32_t i = 0; i < ACK_Q_SIZE; i++)
+  {
+    UTIL_TIMER_Create(&ackQ[i].timer, ACK_FIRST_DELAY_MIN_MS, UTIL_TIMER_ONESHOT, OnAckTimer, (void *)i);
+  }
+  /* JOIN: kimlik yokken A1 / durum periyodu */
+  UTIL_TIMER_Create(&timerJoin, JOIN_PERIOD_MS, UTIL_TIMER_ONESHOT, OnJoinTimer, NULL);
+  if ((joinState == JOIN_ST_NEED_PARAMS) || (joinState == JOIN_ST_WAITING))
+  {
+    UTIL_TIMER_SetPeriod(&timerJoin, 2000);
+    UTIL_TIMER_Start(&timerJoin);
+  }
+  bootTime = UTIL_TIMER_GetCurrentTime();
+#if (TEST_FAR_NODE == 1)
+  APP_LOG(TS_OFF, VLEVEL_M, "!!! TEST_FAR_NODE=1: gateway duyulmuyor sayiliyor (MASA TESTI) !!!\n\r");
+#endif
+#endif
+#if (GATEWAY_MODE == 1) && (TEST_GW_IGNORE_DIRECT != 0)
+  APP_LOG(TS_OFF, VLEVEL_M, "!!! TEST_GW_IGNORE_DIRECT=0x%04X: dogrudan paketleri atiliyor (MASA TESTI) !!!\n\r",
+          (unsigned)TEST_GW_IGNORE_DIRECT);
+#endif
 #if (GATEWAY_MODE == 1)
   /* Komut tekrar yayini (Faz 2) */
   for (uint32_t r = 0; r < RELAY_COUNT_BUF; r++)
   {
     UTIL_TIMER_Create(&relays[r].timer, CMD_RELAY_GAP_MS, UTIL_TIMER_ONESHOT, OnCmdRelayTimerEvent, (void *)r);
   }
+#if (SECURE_ENABLED == 1)
+  for (uint32_t i = 0; i < SEC_TXQ_SIZE; i++)
+  {
+    UTIL_TIMER_Create(&secTxQ[i].timer, CMD_RELAY_GAP_MS, UTIL_TIMER_ONESHOT, OnSecTxTimer, (void *)i);
+  }
+#endif
 #endif
   /* USER CODE END SubghzApp_Init_1 */
 
@@ -352,6 +610,10 @@ void SubghzApp_Init(void)
           RF_FREQUENCY, LORA_SPREADING_FACTOR, (1 << LORA_BANDWIDTH) * 125, TX_OUTPUT_POWER);
   APP_LOG(TS_OFF, VLEVEL_M, "Paket boyu=%d byte, periyot=%d ms + [0..%d) ms jitter\n\r",
           (int)sizeof(pos_packet_t), TX_PERIOD_MS, TX_JITTER_MS);
+#if (SECURE_ENABLED == 1) && (GATEWAY_MODE == 1)
+  APP_LOG(TS_OFF, VLEVEL_M, "SECURE: gateway boru modu (guvenli paketler acilmadan Zybo'ya, %s)\n\r",
+          (SECURE_ONLY == 1) ? "duz paketler atilir" : "duz paketler eski yolla");
+#endif
   APP_LOG(TS_OFF, VLEVEL_M, "---------------\n\r");
 
   /* Ana donguden calisacak isleme gorevini kaydet */
@@ -496,6 +758,41 @@ static void BuildPositionPacket(pos_packet_t *pkt, uint32_t vi)
   pkt->lat   = FAKE_LAT_E7 + (int32_t)(myAddr & 0xFF) * 100 + (int32_t)pkt->seq * 90;
   pkt->lon   = FAKE_LON_E7 + (int32_t)((myAddr >> 8) & 0xFF) * 100 + (int32_t)vi * 12000;
   pkt->flags = 0; /* GPS yok -> fix yok. Gercek GPS gelince POS_FLAG_FIX set edilecek */
+#if (GATEWAY_MODE == 0) && (NODE_UART_BRIDGE == 1)
+  /* Telefon konumunu yolluyorsa (0xC4) sahte konum yerine onu kullan (sadece asil adres) */
+  if (posOvrValid && (vi == 0))
+  {
+    if ((UTIL_TIMER_GetCurrentTime() - posOvrTime) > POS_OVERRIDE_TIMEOUT_MS)
+    {
+      posOvrValid = false;
+      APP_LOG(TS_ON, VLEVEL_L, "[POS] telefondan konum gelmiyor, sahte konuma donuldu\n\r");
+    }
+    else
+    {
+      pkt->lat   = posOvrLat;
+      pkt->lon   = posOvrLon;
+      pkt->flags = POS_FLAG_FIX;
+    }
+  }
+#endif
+#if (GATEWAY_MODE == 0)
+  /* Tek sekme mesh: admin'e ulasamiyorsak komsulardan aktarim iste */
+  if (Node_NeedsRelay())
+  {
+    pkt->flags |= POS_FLAG_RELAY_REQ;
+    if (!relayReqLogged)
+    {
+      relayReqLogged = true;
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] %u sn'dir tabloda yokum: komsulardan aktarim isteniyor\n\r",
+              (unsigned)(REACH_TIMEOUT_MS / 1000));
+    }
+  }
+  else if (relayReqLogged)
+  {
+    relayReqLogged = false;
+    APP_LOG(TS_ON, VLEVEL_L, "[MESH] tekrar dogrudan ulasiyorum: aktarim istegi kapandi\n\r");
+  }
+#endif
 }
 
 /* "lat=41.0082123" seklinde bas (tiny printf float desteklemiyor) */
@@ -511,6 +808,77 @@ static void HandleRxPacket(void)
 {
   pos_packet_t pkt;
 
+#if (SECURE_ENABLED == 1)
+#if (GATEWAY_MODE == 1)
+  /* Gateway duz boru: guvenli paketi acmadan Zybo'ya ver (dogrulama / tekrar yayin Zybo'da) */
+  if ((BufferRx[0] == SEC_VER) && (RxBufferSize >= SEC_PIPE_MIN_LEN))
+  {
+    Gateway_ForwardFrame(BufferRx, RxBufferSize, RssiValue, SnrValue, "guvenli paket");
+    return;
+  }
+#if (SECURE_ONLY == 1)
+  APP_LOG(TS_ON, VLEVEL_L, "[SEC] duz paket atildi (%u B, SECURE_ONLY)\n\r", (unsigned)RxBufferSize);
+  return;
+#endif
+#else
+  /* Node: zarfi ac, MIC + sayac kontrolu. Sonrasi bugunku duz paket isleme ile ayni. */
+  if (!Sec_Incoming())
+  {
+    return;
+  }
+#endif
+#endif
+
+#if (GATEWAY_MODE == 0) && (TEST_FAR_NODE == 1)
+  /* MASA TESTI: gateway'in yayinlarini (tablo, admin komut/karar) duymamis gibi yap */
+  if (((RxBufferSize >= 2) && (BufferRx[0] == DL_TYPE_TABLE) &&
+       (RxBufferSize == DL_PAYLOAD_LEN(BufferRx[1]))) ||
+      ((RxBufferSize == CMD_PACKET_LEN) &&
+       ((BufferRx[0] == CMD_TYPE) || (BufferRx[0] == CMD_TYPE_DEL_ACK) || (BufferRx[0] == JOIN_TYPE_KICK))))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[TEST] gateway yayini (tip 0x%02X) duyulmadi sayildi\n\r", BufferRx[0]);
+    return;
+  }
+#endif
+
+  /* JOIN: katilma istegi (0xA1, 17 B). Gateway Zybo'ya iletir, node'lar yok sayar (v1: aktarim yok) */
+  if ((RxBufferSize == JOIN_REQ_LEN) && (BufferRx[0] == JOIN_TYPE_REQ))
+  {
+#if (GATEWAY_MODE == 1)
+    Gateway_HandleJoinReq();
+#endif
+    return;
+  }
+  /* JOIN: katilma cevabi (0xA2, 15 B). Gateway'in kendi yayini; node'lar kendi dev_id'sine bakar */
+  if ((RxBufferSize == JOIN_ANS_LEN) && (BufferRx[0] == JOIN_TYPE_ANS))
+  {
+#if (GATEWAY_MODE == 0)
+    Join_HandleAnswer();
+#endif
+    return;
+  }
+
+  /* Tek sekme mesh: komsu uzerinden aktarilmis konum mu? (0xE1, 17 byte) */
+  if ((RxBufferSize == RELAY_POS_LEN) && (BufferRx[0] == RELAY_TYPE_POS))
+  {
+    HandleRelayedPos();
+    return;
+  }
+  /* Tek sekme mesh: aktarilmis yukari kontrol paketi mi? (0xE2, 20 byte) */
+  if ((RxBufferSize == RELAY_UL_LEN) && (BufferRx[0] == RELAY_TYPE_UL_CTRL))
+  {
+    HandleRelayedUlCtrl();
+    return;
+  }
+  /* Tek sekme mesh: aktarilmis downlink mi? (0xE3 + orijinal) */
+  if ((RxBufferSize > RELAY_DL_HDR) && (BufferRx[0] == RELAY_TYPE_DL))
+  {
+#if (GATEWAY_MODE == 0)
+    HandleRelayedDl();
+#endif
+    return; /* gateway kendi yayininin aktarilmis halini yok sayar */
+  }
+
   /* Downlink tablo paketi mi? (ilk byte 0xD1, boy 2+12N) */
   if ((RxBufferSize >= 2) && (BufferRx[0] == DL_TYPE_TABLE) &&
       (BufferRx[1] >= 1) && (BufferRx[1] <= DL_MAX_RECORDS) &&
@@ -523,6 +891,15 @@ static void HandleRxPacket(void)
   /* Faz 2: isaret / komut paketi mi? (ilk byte 0xC1, boy 15) */
   if ((RxBufferSize == CMD_PACKET_LEN) && IS_CTRL_TYPE(BufferRx[0]))
   {
+#if (GATEWAY_MODE == 1) && (TEST_GW_IGNORE_DIRECT != 0)
+    /* MASA TESTI: bu node'un DOGRUDAN gelen kontrol paketini at (aktarilmisi 0xE2 ile gelir) */
+    if ((uint16_t)(BufferRx[1] | (BufferRx[2] << 8)) == (uint16_t)TEST_GW_IGNORE_DIRECT)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[TEST] 0x%04X dogrudan kontrol paketi (tip 0x%02X) atildi\n\r",
+              (unsigned)TEST_GW_IGNORE_DIRECT, BufferRx[0]);
+      return;
+    }
+#endif
     HandleCmdPacket();
     return;
   }
@@ -539,6 +916,14 @@ static void HandleRxPacket(void)
   {
     return; /* kendi yankimiz (olmamali ama yine de) */
   }
+#if (GATEWAY_MODE == 1) && (TEST_GW_IGNORE_DIRECT != 0)
+  /* MASA TESTI: bu node menzil disindaymis gibi; dogrudan paketini at (aktarilmisi gelir) */
+  if (pkt.addr == (uint16_t)TEST_GW_IGNORE_DIRECT)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[TEST] 0x%04X dogrudan paketi atildi (seq=%d)\n\r", pkt.addr, pkt.seq);
+    return;
+  }
+#endif
 
   /* Node tablosunda bul ya da ekle, kayip paketleri say */
   PeerInfo_t *p = NULL;
@@ -570,8 +955,8 @@ static void HandleRxPacket(void)
   APP_LOG(TS_ON, VLEVEL_L, "[RX] addr=0x%04X seq=%3d", pkt.addr, pkt.seq);
   LogCoord("lat", pkt.lat);
   LogCoord("lon", pkt.lon);
-  APP_LOG(TS_OFF, VLEVEL_L, " fix=%d rssi=%d snr=%d", (pkt.flags & POS_FLAG_FIX) ? 1 : 0,
-          RssiValue, SnrValue);
+  APP_LOG(TS_OFF, VLEVEL_L, " fix=%d%s rssi=%d snr=%d", (pkt.flags & POS_FLAG_FIX) ? 1 : 0,
+          (pkt.flags & POS_FLAG_RELAY_REQ) ? " AKTARIM-ISTIYOR" : "", RssiValue, SnrValue);
   if (p != NULL)
   {
     APP_LOG(TS_OFF, VLEVEL_L, " alinan=%u kayip=%u", (unsigned)p->rx_count, (unsigned)p->lost_count);
@@ -579,11 +964,338 @@ static void HandleRxPacket(void)
   APP_LOG(TS_OFF, VLEVEL_L, "\n\r");
 
 #if (GATEWAY_MODE == 1)
+  /* Ayni paket komsu uzerinden de gelmis olabilir: bir kez ilet */
+  if (!PosSeen_Mark(pkt.addr, pkt.seq))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[GW] 0x%04X seq=%d zaten iletildi (aktarilmisi once geldi)\n\r",
+            pkt.addr, pkt.seq);
+    return;
+  }
   /* Adres filtrelemesi YOK: hangi node'un kabul edilecegine Zybo PL karar verir */
   Gateway_ForwardPacket(&pkt, RssiValue, SnrValue);
 #if (GATEWAY_LOCAL_TABLE == 1)
   LocalTable_Update(&pkt);
 #endif
+#else
+  /* Tek sekme mesh: komsu aktarim istiyor. Onu "musteri" olarak kaydet (asagi yon icin);
+     biz admin'e dogrudan ulasiyorsak konumunu aktar. */
+  if (pkt.flags & POS_FLAG_RELAY_REQ)
+  {
+    Client_Touch(pkt.addr);
+    if (Node_CanRelay())
+    {
+      Relay_Enqueue(RKEY(RTAG_POS, ((uint32_t)pkt.addr << 8) | pkt.seq), RELAY_TYPE_POS,
+                    true, RssiValue, SnrValue, (const uint8_t *)&pkt, sizeof(pkt),
+                    POS_RELAY_DELAY_MIN_MS, POS_RELAY_DELAY_RAND_MS, "konum");
+    }
+  }
+#endif
+}
+
+/* ---------------- Tek sekme mesh ---------------- */
+
+#if (GATEWAY_MODE == 0)
+/* Admin'e DOGRUDAN ulasamiyor muyuz? REACH_TIMEOUT_MS'dir tabloda kendimizi dogrudan
+   ulasmis (bit2 yok) gormedik; hic gormediysek acilistan beri say. Aktarimla ulasiyorsak
+   da istek acik kalir, yoksa aktarim durur ve konumumuz admin'de bayatlar (salinim). */
+static bool Node_NeedsRelay(void)
+{
+  uint32_t ref = everInTable ? lastInTableTime : bootTime;
+  return (UTIL_TIMER_GetCurrentTime() - ref) > REACH_TIMEOUT_MS;
+}
+
+/* Baskasinin paketini aktarabilir miyiz? Sadece son REACH_TIMEOUT_MS icinde admin'e
+   DOGRUDAN ulastiysak (tek sekme: aktarimla ulasan node baskasini aktarmaz) */
+static bool Node_CanRelay(void)
+{
+  return everInTable && ((UTIL_TIMER_GetCurrentTime() - lastInTableTime) <= REACH_TIMEOUT_MS);
+}
+
+/* Paket anahtari daha once aktarildi / aktarildigi duyuldu mu? Degilse kaydet, true don */
+static bool RelaySeen_Mark(uint32_t key)
+{
+  for (uint32_t i = 0; i < RELAY_SEEN_SIZE; i++)
+  {
+    if (relaySeen[i] == key) { return false; }
+  }
+  relaySeen[relaySeenIdx] = key;
+  relaySeenIdx = (uint8_t)((relaySeenIdx + 1) % RELAY_SEEN_SIZE);
+  return true;
+}
+
+/* Paketi [type][aktaran][(RSSI SNR)][body] olarak sar ve rastgele gecikmeyle aktarmak
+   uzere kuyruga al. Ayni anahtar daha once aktarildiysa / duyulduysa bir sey yapmaz. */
+static void Relay_Enqueue(uint32_t key, uint8_t type, bool withLink, int16_t rssi, int8_t snr,
+                          const uint8_t *body, uint16_t bodyLen,
+                          uint32_t minMs, uint32_t randMs, const char *what)
+{
+  uint16_t hdr = withLink ? 5U : 3U;
+  RelaySlot_t *s = NULL;
+  uint16_t room = MAX_APP_BUFFER_SIZE;
+
+#if (SECURE_ENABLED == 1)
+  /* Ic ice aktarim: uzak node'un / Zybo'nun guvenli paketi ACILMADAN, aynen tasinir */
+  if (secRawValid)
+  {
+    body = secRaw;
+    bodyLen = secRawLen;
+  }
+  room = MAX_APP_BUFFER_SIZE - SEC_OVERHEAD;   /* bizim zarfimiza da sigmali */
+#endif
+  if ((uint32_t)hdr + bodyLen > room)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[MESH] %s cok buyuk (%u B), aktarilmadi\n\r", what, (unsigned)bodyLen);
+    return;
+  }
+  if (!RelaySeen_Mark(key))
+  {
+    return; /* bu paketi zaten aktardik ya da baskasi aktardi */
+  }
+  for (uint32_t i = 0; i < RELAY_Q_SIZE; i++)
+  {
+    if (!relayQ[i].active) { s = &relayQ[i]; break; }
+  }
+  if (s == NULL)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarim kuyrugu dolu, %s atlandi\n\r", what);
+    return;
+  }
+  if (rssi < -128) { rssi = -128; }
+  if (rssi > 127)  { rssi = 127; }
+  s->buf[0] = type;
+  s->buf[1] = (uint8_t)(myAddr & 0xFF);
+  s->buf[2] = (uint8_t)(myAddr >> 8);
+  if (withLink)
+  {
+    s->buf[3] = (uint8_t)(int8_t)rssi;
+    s->buf[4] = (uint8_t)snr;
+  }
+  memcpy(&s->buf[hdr], body, bodyLen);
+  s->len = (uint8_t)(hdr + bodyLen);
+  s->key = key;
+  s->active = true;
+  s->due = false;
+  uint32_t delay = minMs + (Rand32() % randMs);
+  UTIL_TIMER_Stop(&s->timer);
+  UTIL_TIMER_SetPeriod(&s->timer, delay);
+  UTIL_TIMER_Start(&s->timer);
+  APP_LOG(TS_ON, VLEVEL_L, "[MESH] %s %u ms sonra aktarilacak (tip 0x%02X)\n\r", what, (unsigned)delay, type);
+}
+
+/* Baska bir komsu bu paketi aktardi: bizim bekleyen aktarimimizi iptal et */
+static void Relay_Cancel(uint32_t key, uint16_t byWhom)
+{
+  (void)RelaySeen_Mark(key);
+  for (uint32_t i = 0; i < RELAY_Q_SIZE; i++)
+  {
+    if (relayQ[i].active && (relayQ[i].key == key))
+    {
+      relayQ[i].active = false;
+      relayQ[i].due = false;
+      UTIL_TIMER_Stop(&relayQ[i].timer);
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] 0x%04X ayni paketi aktardi, bizimki iptal (tip 0x%02X)\n\r",
+              byWhom, relayQ[i].buf[0]);
+    }
+  }
+}
+
+static void OnRelaySlotTimer(void *context)
+{
+  relayQ[(uint32_t)context].due = true;
+  PostEvent(EV_POS_RELAY);
+}
+
+/* Tablonun kimligi icin kisa ozet (FNV-1a, 24 bite katlanmis) */
+static uint32_t Hash24(const uint8_t *p, uint16_t n)
+{
+  uint32_t h = 2166136261U;
+  for (uint16_t i = 0; i < n; i++)
+  {
+    h ^= p[i];
+    h *= 16777619U;
+  }
+  return (h >> 24) ^ (h & 0x00FFFFFFU);
+}
+
+/* Bayrakli paketini duydugumuz node'u musteri listesine al / tazele */
+static void Client_Touch(uint16_t addr)
+{
+  uint32_t now = UTIL_TIMER_GetCurrentTime();
+  RelayClient_t *slot = NULL;
+  for (uint32_t i = 0; i < MAX_RELAY_CLIENTS; i++)
+  {
+    if (relayClients[i].addr == addr) { slot = &relayClients[i]; break; }
+  }
+  if (slot == NULL)
+  {
+    /* bos ya da en eski yuva */
+    slot = &relayClients[0];
+    for (uint32_t i = 0; i < MAX_RELAY_CLIENTS; i++)
+    {
+      if (relayClients[i].addr == 0) { slot = &relayClients[i]; break; }
+      if ((now - relayClients[i].lastSeen) > (now - slot->lastSeen)) { slot = &relayClients[i]; }
+    }
+    if (!Client_IsActive(addr))
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] 0x%04X aktarim istiyor: musteri olarak eklendi\n\r", addr);
+    }
+    slot->addr = addr;
+  }
+  slot->lastSeen = now;
+}
+
+static bool Client_IsActive(uint16_t addr)
+{
+  uint32_t now = UTIL_TIMER_GetCurrentTime();
+  for (uint32_t i = 0; i < MAX_RELAY_CLIENTS; i++)
+  {
+    if ((relayClients[i].addr == addr) && (addr != 0) &&
+        ((now - relayClients[i].lastSeen) <= RELAY_CLIENT_TIMEOUT_MS))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool Client_AnyActive(void)
+{
+  uint32_t now = UTIL_TIMER_GetCurrentTime();
+  for (uint32_t i = 0; i < MAX_RELAY_CLIENTS; i++)
+  {
+    if ((relayClients[i].addr != 0) && ((now - relayClients[i].lastSeen) <= RELAY_CLIENT_TIMEOUT_MS))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Aktarilmis downlink (0xE3) geldi: aktarim modundaysak icini gateway'den gelmis gibi isle */
+static void HandleRelayedDl(void)
+{
+  uint16_t relayer = (uint16_t)(BufferRx[1] | (BufferRx[2] << 8));
+  uint16_t len = (uint16_t)(RxBufferSize - RELAY_DL_HDR);
+  const uint8_t *in = &BufferRx[RELAY_DL_HDR];
+  uint32_t key;
+
+  /* Anahtar: baska aktaran yolladiysa bizim bekleyen ayni aktarimimizi iptal et */
+  if ((in[0] == DL_TYPE_TABLE) && (len >= 2) && (len == DL_PAYLOAD_LEN(in[1])))
+  {
+    key = RKEY(RTAG_TABLE, Hash24(in, len));
+  }
+  else if ((len == CMD_PACKET_LEN) &&
+           ((in[0] == CMD_TYPE) || (in[0] == CMD_TYPE_DEL_ACK) || (in[0] == JOIN_TYPE_KICK)))
+  {
+    key = RKEY(RTAG_DL(in[0]), ((uint32_t)(in[1] | (in[2] << 8)) << 8) | in[5]);
+  }
+  else
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[MESH] taninmayan 0xE3 icerigi (tip 0x%02X, %u B)\n\r", in[0], (unsigned)len);
+    return;
+  }
+  Relay_Cancel(key, relayer);
+
+  if (!Node_NeedsRelay())
+  {
+    return; /* admin'e dogrudan ulasiyoruz: orijinalini gateway'den zaten duyduk */
+  }
+
+  APP_LOG(TS_ON, VLEVEL_L, "[MESH] 0x%04X uzerinden downlink alindi (tip 0x%02X)\n\r", relayer, in[0]);
+  memmove(BufferRx, in, len);
+  RxBufferSize = len;
+  rxViaRelay = true;
+  if (BufferRx[0] == DL_TYPE_TABLE)
+  {
+    HandleDownlinkTable();
+  }
+  else
+  {
+    HandleCmdPacket();
+  }
+  rxViaRelay = false;
+}
+#endif
+
+#if (GATEWAY_MODE == 1)
+/* Bu (addr, seq) Zybo'ya iletildi mi? Iletilmediyse kaydet, true don */
+static bool PosSeen_Mark(uint16_t addr, uint8_t seq)
+{
+  uint32_t key = 0x80000000U | ((uint32_t)addr << 8) | seq;
+  for (uint32_t i = 0; i < POS_SEEN_SIZE; i++)
+  {
+    if (posSeen[i] == key) { return false; }
+  }
+  posSeen[posSeenIdx] = key;
+  posSeenIdx = (uint8_t)((posSeenIdx + 1) % POS_SEEN_SIZE);
+  return true;
+}
+#endif
+
+/* Aktarilmis konum (0xE1) geldi */
+static void HandleRelayedPos(void)
+{
+  pos_packet_t inner;
+  uint16_t relayer = (uint16_t)(BufferRx[1] | (BufferRx[2] << 8));
+  memcpy(&inner, &BufferRx[RELAY_POS_HDR], sizeof(inner));
+
+  APP_LOG(TS_ON, VLEVEL_L, "[RELAY] 0x%04X seq=%d aktaran=0x%04X (aktaranin duydugu rssi=%d) rssi=%d\n\r",
+          inner.addr, inner.seq, relayer, (int)(int8_t)BufferRx[3], RssiValue);
+
+#if (GATEWAY_MODE == 1)
+  /* Ayni paket dogrudan da gelmis olabilir: bir kez ilet */
+  if (!PosSeen_Mark(inner.addr, inner.seq))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[RELAY] zaten iletildi, atlandi\n\r");
+    return;
+  }
+  /* "Aktarimla geldi" bayragi: Zybo tabloda geri yollar, node bunu gorup istegi acik tutar */
+  inner.flags |= POS_FLAG_VIA_RELAY;
+  BufferRx[RELAY_POS_HDR + 11] = inner.flags;   /* 0xE1 paketindeki kopyayi da guncelle */
+#if (GW_FORWARD_RELAY_INFO == 1)
+  /* Aktaran bilgisiyle birlikte yeni cerceve (Zybo 0xE1'i taniyor) */
+  Gateway_ForwardRelayed(BufferRx, RssiValue, SnrValue);
+#else
+  /* Eski yol: icindeki 12 byte normal konum cercevesiyle (Zybo aktarani bilmez).
+     RSSI/SNR = aktaranin gateway'e geldigi baglanti. */
+  Gateway_ForwardPacket(&inner, RssiValue, SnrValue);
+#endif
+#if (GATEWAY_LOCAL_TABLE == 1)
+  LocalTable_Update(&inner);
+#endif
+#else
+  /* Baska bir komsu bu paketi aktardi: bizim bekleyen aktarimimizi iptal et */
+  Relay_Cancel(RKEY(RTAG_POS, ((uint32_t)inner.addr << 8) | inner.seq), relayer);
+  if (IsMyAddr(inner.addr))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[MESH] konumum 0x%04X uzerinden aktarildi\n\r", relayer);
+  }
+#endif
+}
+
+/* Aktarilmis yukari kontrol paketi (0xE2) geldi */
+static void HandleRelayedUlCtrl(void)
+{
+  uint16_t relayer = (uint16_t)(BufferRx[1] | (BufferRx[2] << 8));
+  const uint8_t *in = &BufferRx[RELAY_UL_HDR];
+  uint16_t src = (uint16_t)(in[1] | (in[2] << 8));
+
+  if (!((in[0] == CMD_TYPE) || (in[0] == CMD_TYPE_DEL_REQ) || (in[0] == CMD_TYPE_ACK) ||
+        (in[0] == JOIN_TYPE_LEAVE)))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[RELAY] 0xE2 icinde beklenmeyen tip 0x%02X\n\r", in[0]);
+    return;
+  }
+  APP_LOG(TS_ON, VLEVEL_L, "[RELAY] kontrol tip 0x%02X src=0x%04X id=%u aktaran=0x%04X\n\r",
+          in[0], src, in[5], relayer);
+#if (GATEWAY_MODE == 1)
+  /* Icindeki 15 byte'i dogrudan gelmis gibi isle (Zybo'ya ilet / 0xC1 ise 3x yayinla) */
+  memmove(BufferRx, in, CMD_PACKET_LEN);
+  RxBufferSize = CMD_PACKET_LEN;
+  HandleCmdPacket();
+#else
+  /* Baska komsu aktardi: bizim bekleyen ayni aktarimimizi iptal et */
+  Relay_Cancel(RKEY(RTAG_UL(in[0]), ((uint32_t)src << 8) | in[5]), relayer);
 #endif
 }
 
@@ -596,7 +1308,42 @@ static void HandleDownlinkTable(void)
   HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET); /* kirmizi = RX */
   UTIL_TIMER_Start(&timerLed);
 
-  APP_LOG(TS_ON, VLEVEL_L, "[TABLO] %d node (rssi=%d snr=%d):\n\r", n, RssiValue, SnrValue);
+#if (GATEWAY_MODE == 0)
+  const char *via = rxViaRelay ? " (aktarimla)" : "";
+#else
+  const char *via = "";
+#endif
+  APP_LOG(TS_ON, VLEVEL_L, "[TABLO] %d node (rssi=%d snr=%d)%s:\n\r", n, RssiValue, SnrValue, via);
+#if (GATEWAY_MODE == 0)
+  /* Tek sekme mesh: musterimiz varsa tabloyu onlara asagi aktar (aktarilmis tablo tekrar aktarilmaz) */
+  if (!rxViaRelay && Node_CanRelay() && Client_AnyActive())
+  {
+    Relay_Enqueue(RKEY(RTAG_TABLE, Hash24(BufferRx, RxBufferSize)), RELAY_TYPE_DL, false, 0, 0,
+                  BufferRx, RxBufferSize, DL_RELAY_DELAY_MIN_MS, DL_RELAY_DELAY_RAND_MS, "tablo (asagi)");
+  }
+#endif
+#if (GATEWAY_MODE == 0)
+  /* Tek sekme mesh: tabloda kendimizi goruyorsak admin'e ulasiyoruz */
+  for (uint8_t i = 0; i < n; i++)
+  {
+    memcpy(&rec, &BufferRx[2 + i * sizeof(pos_packet_t)], sizeof(rec));
+    if (rec.addr == myAddr)
+    {
+      if (rec.flags & POS_FLAG_VIA_RELAY)
+      {
+        /* Admin bizi sadece komsu uzerinden goruyor: aktarim istegini kapatma */
+        lastViaRelayTime = UTIL_TIMER_GetCurrentTime();
+        APP_LOG(TS_ON, VLEVEL_L, "[MESH] admin beni aktarimla goruyor (seq=%d)\n\r", rec.seq);
+      }
+      else
+      {
+        lastInTableTime = UTIL_TIMER_GetCurrentTime();
+        everInTable = true;
+      }
+      break;
+    }
+  }
+#endif
   for (uint8_t i = 0; i < n; i++)
   {
     memcpy(&rec, &BufferRx[2 + i * sizeof(pos_packet_t)], sizeof(rec));
@@ -611,6 +1358,38 @@ static void HandleDownlinkTable(void)
   /* Tabloyu oldugu gibi (D1 N kayitlar) cerceveleyip ESP32'ye yolla -> BLE -> telefon */
   Uart1_SendFrame(BufferRx, RxBufferSize);
   APP_LOG(TS_ON, VLEVEL_L, "[BLE] tablo -> ESP32 (%d byte payload)\n\r", RxBufferSize);
+
+  /* Dolayli onay: Zybo'nun tablosunda kendi kaydimiz var mi? Varsa son konumumuz
+     admin'e ulasmis demektir. Sonucu telefona 0xC6 ile bildir (LoRa'ya gitmez). */
+  {
+    uint8_t st[NODE_STATUS_LEN] = {0};
+    st[0] = CMD_TYPE_NODE_STATUS;
+    st[1] = (uint8_t)(myAddr & 0xFF);
+    st[2] = (uint8_t)(myAddr >> 8);
+    st[3] = (uint8_t)(vSeq[0] - 1U);           /* son yollanan seq */
+    for (uint8_t i = 0; i < n; i++)
+    {
+      memcpy(&rec, &BufferRx[2 + i * sizeof(pos_packet_t)], sizeof(rec));
+      if (rec.addr == myAddr)
+      {
+        st[4] = 1;
+        st[5] = rec.seq;
+        st[6] = rec.flags;
+        break;
+      }
+    }
+    Uart1_SendFrame(st, NODE_STATUS_LEN);
+    Join_SendStatus();
+    if (st[4])
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[ONAY] admin son konumumu aldi: seq=%u (son yollanan %u)\n\r",
+              st[5], st[3]);
+    }
+    else
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[ONAY] tabloda yokum (whitelist / menzil?)\n\r");
+    }
+  }
 #endif
 }
 
@@ -620,7 +1399,7 @@ static void HandleDownlinkTable(void)
 static bool Cmd_MarkSeen(uint8_t type, uint16_t src, uint8_t id)
 {
   /* 0 = bos yuva olmasin diye bit31 hep 1; tip de anahtarda (0xC1/C2/C3 ayri) */
-  uint32_t key = 0x80000000U | ((uint32_t)(type & 0x0F) << 24) | ((uint32_t)src << 8) | id;
+  uint32_t key = 0x80000000U | ((uint32_t)CTRL_TAG(type) << 24) | ((uint32_t)src << 8) | id;
   for (uint32_t i = 0; i < CMD_SEEN_SIZE; i++)
   {
     if (cmdSeen[i] == key) { return false; }
@@ -645,11 +1424,23 @@ static void LogCmd(const char *tag, const uint8_t *p)
   {
     /* 0xC2 / 0xC3: hedef isaret = [7..8] src, [9] msg_id */
     APP_LOG(TS_ON, VLEVEL_L, "[%s] %s src=0x%04X dst=0x%04X id=%u hedef=0x%04X/%u", 
-            (c.type == CMD_TYPE_DEL_REQ) ? "SIL-ISTEK" : "SIL-KARAR", tag,
+            (c.type == CMD_TYPE_DEL_REQ) ? "SIL-ISTEK" :
+            (c.type == CMD_TYPE_ACK) ? "ACK" :
+            (c.type == JOIN_TYPE_ANS) ? "JOIN-CEVAP" :
+            (c.type == JOIN_TYPE_KICK) ? "KICK" :
+            (c.type == JOIN_TYPE_LEAVE) ? "LEAVE" : "SIL-KARAR", tag,
             c.src, c.dst, c.msg_id, (unsigned)(p[7] | (p[8] << 8)), p[9]);
     if (c.type == CMD_TYPE_DEL_ACK)
     {
       APP_LOG(TS_OFF, VLEVEL_L, " karar=%s", (p[6] == 1) ? "ONAY" : "RED");
+    }
+    else if (c.type == CMD_TYPE_ACK)
+    {
+      APP_LOG(TS_OFF, VLEVEL_L, " %s", (p[6] == ACK_KIND_SEEN) ? "OKUNDU" : "ULASTI");
+    }
+    else if (c.type == JOIN_TYPE_KICK)
+    {
+      APP_LOG(TS_OFF, VLEVEL_L, " sebep=%s", (p[10] == KICK_REASON_ADMIN) ? "ADMIN" : "AYRILMA-ONAYI");
     }
   }
 }
@@ -663,6 +1454,66 @@ static void HandleCmdPacket(void)
 
   LogCmd("rx", BufferRx);
   APP_LOG(TS_OFF, VLEVEL_L, " rssi=%d%s\n\r", RssiValue, fresh ? "" : " (tekrar, atlandi)");
+
+#if (GATEWAY_MODE == 0)
+  if (!rxViaRelay && Node_CanRelay())
+  {
+    /* Tek sekme mesh, yukari: musterinin 0xC1 / 0xC2 / 0xC5'ini gateway'e aktar */
+    if (fresh && Client_IsActive(c.src) &&
+        ((c.type == CMD_TYPE) || (c.type == CMD_TYPE_DEL_REQ) || (c.type == CMD_TYPE_ACK) ||
+         (c.type == JOIN_TYPE_LEAVE)))
+    {
+      Relay_Enqueue(RKEY(RTAG_UL(c.type), ((uint32_t)c.src << 8) | c.msg_id), RELAY_TYPE_UL_CTRL,
+                    true, RssiValue, SnrValue, BufferRx, CMD_PACKET_LEN,
+                    POS_RELAY_DELAY_MIN_MS, POS_RELAY_DELAY_RAND_MS, "kontrol (yukari)");
+      if (c.type == CMD_TYPE)
+      {
+        /* Gateway bunu 3x yayinlayinca donen kopyayi musteriye asagi aktaracagiz (✓✓ icin) */
+        echoWaitKey = RKEY(RTAG_DL(CMD_TYPE), ((uint32_t)c.src << 8) | c.msg_id);
+      }
+    }
+    /* Tek sekme mesh, asagi: 0xC1 / 0xC3'u musterilere aktar. Musterinin kendi 0xC1'inin
+       ilk kopyasi musteriden gelir (onu aktarmak sahte "aga ulasti" olur); gateway'den
+       donen tekrar kopyasini aktariyoruz. */
+    if (Client_AnyActive() &&
+        ((c.type == CMD_TYPE) || (c.type == CMD_TYPE_DEL_ACK) || (c.type == JOIN_TYPE_KICK)))
+    {
+      uint32_t k = RKEY(RTAG_DL(c.type), ((uint32_t)c.src << 8) | c.msg_id);
+      bool fromClient = Client_IsActive(c.src);
+      /* Zybo ayni komutu (ayni msg_id) yeniden denediyse: gateway'in 3x tekrarindan sonra
+         (DL_CMD_RETRY_GAP_MS'den uzun aradan sonra) yine duyulursa tekrar aktar */
+      bool retry = (!fromClient && !fresh && ((c.type == CMD_TYPE) || (c.type == JOIN_TYPE_KICK)) &&
+                    DlCmd_RetryDue(k));
+      if ((!fromClient && fresh) || retry || (fromClient && !fresh && (k == echoWaitKey)))
+      {
+        if (fromClient) { echoWaitKey = 0; }
+        if (retry)
+        {
+          RelaySeen_Forget(k);
+          APP_LOG(TS_ON, VLEVEL_L, "[MESH] admin komutu yeniden denendi, tekrar asagi aktariliyor\n\r");
+        }
+        if (!fromClient) { DlCmd_Note(k); }
+        Relay_Enqueue(k, RELAY_TYPE_DL, false, 0, 0, BufferRx, CMD_PACKET_LEN,
+                      DL_RELAY_DELAY_MIN_MS, DL_RELAY_DELAY_RAND_MS, "kontrol (asagi)");
+      }
+    }
+  }
+  /* Baska node'un ACK'i / ayrilma istegi: bizi ilgilendirmez */
+  if ((c.type == CMD_TYPE_ACK) || (c.type == JOIN_TYPE_LEAVE)) { return; }
+  /* KICK / ayrilma onayi: tekrar kopyalari da islenir (ULASTI tekrar yollanabilsin) */
+  if (c.type == JOIN_TYPE_KICK)
+  {
+    Join_HandleKick();
+    return;
+  }
+  /* Admin'in BANA ozel komutu: gateway'in her kopyasina "ULASTI" ACK'i yolla. Tekrar eden
+     kopyalara da yollanir; boylece ilk ACK kaybolursa ya da Zybo ayni msg_id ile tekrar
+     yollarsa da admin onayi alir. Telefona ise sadece ilk kopya gider (asagida). */
+  if ((c.type == CMD_TYPE) && (c.src == ADDR_ADMIN) && IsMyAddr(c.dst))
+  {
+    Node_QueueAck(c.dst, c.src, c.msg_id, ACK_KIND_DELIVERED);
+  }
+#endif
   if (!fresh) { return; }
 
   HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET); /* kirmizi = RX */
@@ -684,6 +1535,24 @@ static void HandleCmdPacket(void)
     Gateway_ForwardCmd(BufferRx, RssiValue, SnrValue);
 #else
     APP_LOG(TS_ON, VLEVEL_L, "[SIL-ISTEK] Zybo'ya iletilmedi (GW_FORWARD_CMD=0)\n\r");
+#endif
+  }
+  else if (c.type == JOIN_TYPE_LEAVE)
+  {
+    /* 0xA4: node takimdan ayriliyor, SADECE Zybo'ya gider (cevabi Zybo 0xA3 sebep 2 ile verir) */
+#if (GW_FORWARD_CMD == 1)
+    Gateway_ForwardCmd(BufferRx, RssiValue, SnrValue);
+#else
+    APP_LOG(TS_ON, VLEVEL_L, "[LEAVE] Zybo'ya iletilmedi (GW_FORWARD_CMD=0)\n\r");
+#endif
+  }
+  else if (c.type == CMD_TYPE_ACK)
+  {
+    /* 0xC5: node'un komut onayi, SADECE Zybo'ya gider, havada tekrar yayinlanmaz */
+#if (GW_FORWARD_CMD == 1)
+    Gateway_ForwardCmd(BufferRx, RssiValue, SnrValue);
+#else
+    APP_LOG(TS_ON, VLEVEL_L, "[ACK] Zybo'ya iletilmedi (GW_FORWARD_CMD=0)\n\r");
 #endif
   }
   /* 0xC3'u gateway'in kendisi yayinlar; havadan duymaz (duyarsa yok sayilir) */
@@ -768,6 +1637,57 @@ static void Node_HandleUartFrame(void)
 {
   uint16_t len = dlFrameLen;
 
+  /* 0xC9 / 0xCC: katilma parametreleri / takimdan ayril (yerel; ayrilmayi node 0xA4 ile bildirir) */
+  if ((len == CMD_PACKET_LEN) && (dlFrame[0] == CMD_TYPE_JOIN_PARAMS))
+  {
+    Join_Start(dlFrame[1], dlFrame[2], (uint16_t)(dlFrame[3] | (dlFrame[4] << 8)));
+    dlFrameReady = false;
+    return;
+  }
+  if ((len == CMD_PACKET_LEN) && (dlFrame[0] == CMD_TYPE_LEAVE))
+  {
+    Join_Leave();
+    dlFrameReady = false;
+    return;
+  }
+
+  /* 0xC4: telefonun konumu. LoRa'ya gitmez, sadece bu node'un yayinladigi konumu degistirir */
+  if ((len == CMD_PACKET_LEN) && (dlFrame[0] == CMD_TYPE_SET_POS))
+  {
+    if (dlFrame[9] == 1)
+    {
+      memcpy(&posOvrLat, &dlFrame[1], 4);   /* little-endian, Cortex-M4 ile ayni */
+      memcpy(&posOvrLon, &dlFrame[5], 4);
+      posOvrTime = UTIL_TIMER_GetCurrentTime();
+      if (!posOvrValid)
+      {
+        APP_LOG(TS_ON, VLEVEL_L, "[POS] telefon konumu kullaniliyor:");
+        LogCoord("lat", posOvrLat);
+        LogCoord("lon", posOvrLon);
+        APP_LOG(TS_OFF, VLEVEL_L, "\n\r");
+      }
+      posOvrValid = true;
+    }
+    else
+    {
+      posOvrValid = false;
+      APP_LOG(TS_ON, VLEVEL_L, "[POS] telefon konum paylasimini kapatti, sahte konuma donuldu\n\r");
+    }
+    dlFrameReady = false;
+    return;
+  }
+
+  /* 0xC5 OKUNDU: telefonda kullanici admin komutunu gordu. Node adres ve sayaci doldurup yollar */
+  if ((len == CMD_PACKET_LEN) && (dlFrame[0] == CMD_TYPE_ACK))
+  {
+    if (dlFrame[6] == ACK_KIND_SEEN)
+    {
+      Node_QueueAck(myAddr, (uint16_t)(dlFrame[7] | (dlFrame[8] << 8)), dlFrame[9], ACK_KIND_SEEN);
+    }
+    dlFrameReady = false;
+    return;
+  }
+
   if ((len != CMD_PACKET_LEN) || ((dlFrame[0] != CMD_TYPE) && (dlFrame[0] != CMD_TYPE_DEL_REQ)))
   {
     APP_LOG(TS_ON, VLEVEL_L, "[CMD] ESP32'den gecersiz cerceve (boy=%d, tip=0x%02X)\n\r",
@@ -796,6 +1716,828 @@ static void Node_HandleUartFrame(void)
   APP_LOG(TS_OFF, VLEVEL_L, " -> LoRa\n\r");
 }
 #endif
+
+#if (GATEWAY_MODE == 0)
+/* 0xC5 ACK'ini kuyruga al: ACK_REPEAT kez yollanir (ilki kisa rastgele gecikmeyle).
+   Ayni ACK hala tekrarlaniyorsa yeni bir sey yapmaz (komutun 2./3. kopyasi). */
+static void Node_QueueAck(uint16_t me, uint16_t ackedSrc, uint8_t ackedId, uint8_t kind)
+{
+  AckSlot_t *s = NULL;
+
+  for (uint32_t i = 0; i < ACK_Q_SIZE; i++)
+  {
+    if (ackQ[i].active && (ackQ[i].ackedSrc == ackedSrc) && (ackQ[i].ackedId == ackedId) &&
+        (ackQ[i].kind == kind))
+    {
+      return; /* bu ACK zaten tekrarlaniyor */
+    }
+  }
+  for (uint32_t i = 0; i < ACK_Q_SIZE; i++)
+  {
+    if (!ackQ[i].active) { s = &ackQ[i]; break; }
+  }
+  if (s == NULL)
+  {
+    /* Kuyruk dolu: en az tekrari kalan (en cok yollanmis) ACK'in yerini al */
+    s = &ackQ[0];
+    for (uint32_t i = 1; i < ACK_Q_SIZE; i++)
+    {
+      if (ackQ[i].left < s->left) { s = &ackQ[i]; }
+    }
+    UTIL_TIMER_Stop(&s->timer);
+    APP_LOG(TS_ON, VLEVEL_L, "[ACK] kuyruk dolu, en eski ACK'in kalan tekrarlari birakildi\n\r");
+  }
+  s->me = me;
+  s->ackedSrc = ackedSrc;
+  s->ackedId = ackedId;
+  s->kind = kind;
+  s->left = ACK_REPEAT;
+  s->active = true;
+  s->due = false;
+  UTIL_TIMER_SetPeriod(&s->timer, ACK_FIRST_DELAY_MIN_MS + (Rand32() % ACK_FIRST_DELAY_RAND_MS));
+  UTIL_TIMER_Start(&s->timer);
+}
+
+static void OnAckTimer(void *context)
+{
+  ackQ[(uint32_t)context].due = true;
+  PostEvent(EV_ACK);
+}
+
+/* Anahtari "goruldu" listesinden cikar (yeniden aktarim icin) */
+static void RelaySeen_Forget(uint32_t key)
+{
+  for (uint32_t i = 0; i < RELAY_SEEN_SIZE; i++)
+  {
+    if (relaySeen[i] == key) { relaySeen[i] = 0; }
+  }
+}
+
+/* Bu admin komutu son aktarimindan DL_CMD_RETRY_GAP_MS sonra mi yine duyuldu? (Zybo yeniden denedi) */
+static bool DlCmd_RetryDue(uint32_t key)
+{
+  for (uint32_t i = 0; i < DL_CMD_HIST; i++)
+  {
+    if (dlCmdHist[i].key == key)
+    {
+      return (UTIL_TIMER_GetCurrentTime() - dlCmdHist[i].t) > DL_CMD_RETRY_GAP_MS;
+    }
+  }
+  return false;
+}
+
+static void DlCmd_Note(uint32_t key)
+{
+  for (uint32_t i = 0; i < DL_CMD_HIST; i++)
+  {
+    if (dlCmdHist[i].key == key)
+    {
+      dlCmdHist[i].t = UTIL_TIMER_GetCurrentTime();
+      return;
+    }
+  }
+  dlCmdHist[dlCmdHistIdx].key = key;
+  dlCmdHist[dlCmdHistIdx].t = UTIL_TIMER_GetCurrentTime();
+  dlCmdHistIdx = (uint8_t)((dlCmdHistIdx + 1) % DL_CMD_HIST);
+}
+#endif
+
+/* ======================= JOIN v1: takimli kimlik ======================= */
+
+/* CRC-32 (IEEE 802.3 / zlib, yansitilmis, poly 0xEDB88320). dev_id = CRC32(UID 12 byte) */
+static uint32_t Crc32(const uint8_t *p, uint32_t n)
+{
+  uint32_t crc = 0xFFFFFFFFU;
+  for (uint32_t i = 0; i < n; i++)
+  {
+    crc ^= p[i];
+    for (int b = 0; b < 8; b++)
+    {
+      crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320U) : (crc >> 1);
+    }
+  }
+  return ~crc;
+}
+
+#if (GATEWAY_MODE == 0)
+/* Kimlik sayfasini okuma adresi (test ortaminda degistirilebilsin diye makro) */
+#ifndef ID_FLASH_READ_PTR
+#define ID_FLASH_READ_PTR   ((const void *)ID_FLASH_ADDR)
+#endif
+
+/* dev_id'yi hesapla, flash'ta kimlik varsa adresi ona cevir */
+static void Join_Init(void)
+{
+  uint8_t u[12];
+  uint32_t w;
+  w = HAL_GetUIDw0(); memcpy(&u[0], &w, 4);
+  w = HAL_GetUIDw1(); memcpy(&u[4], &w, 4);
+  w = HAL_GetUIDw2(); memcpy(&u[8], &w, 4);
+  myDevId = Crc32(u, 12);
+  uidAddr = myAddr;
+#if (JOIN_ENABLED == 1)
+  {
+    IdRec_t r;
+    if (Id_Load(&r))
+    {
+      myAddr = r.addr;
+      joinTeam = r.team;
+      joinNum = r.num;
+      joinState = JOIN_ST_JOINED;
+      APP_LOG(TS_OFF, VLEVEL_M, "JOIN: kayitli kimlik takim=%u numara=%u adres=0x%04X\n\r",
+              r.team, r.num, r.addr);
+    }
+    else
+    {
+      joinState = JOIN_ST_NEED_PARAMS;
+      APP_LOG(TS_OFF, VLEVEL_M, "JOIN: kimlik yok (dev_id=0x%08X), telefondan takim/numara/PIN bekleniyor, konum yayini KAPALI\n\r",
+              (unsigned int)myDevId);
+    }
+  }
+#else
+  joinState = JOIN_ST_DISABLED;
+#endif
+}
+
+/* Katilma durumunu telefona bildir (0xCB, yerel) */
+static void Join_SendStatus(void)
+{
+#if (NODE_UART_BRIDGE == 1)
+  uint8_t st[JOIN_STATUS_LEN];
+  st[0] = CMD_TYPE_JOIN_STATUS;
+  st[1] = joinState;
+  st[2] = joinResult;
+  st[3] = (uint8_t)(myAddr & 0xFF);
+  st[4] = (uint8_t)(myAddr >> 8);
+  st[5] = joinTeam;
+  st[6] = joinNum;
+  st[7] = joinReqSeq;
+  Uart1_SendFrame(st, JOIN_STATUS_LEN);
+#endif
+}
+
+/* Telefondan katilma parametreleri geldi (0xC9) */
+static void Join_Start(uint8_t team, uint8_t num, uint16_t pin)
+{
+#if (JOIN_ENABLED == 1)
+  if ((joinState == JOIN_ST_JOINED) || (joinState == JOIN_ST_LEAVING))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[JOIN] zaten kimlik var (0x%04X); once takimdan ayrilin\n\r", myAddr);
+    Join_SendStatus();
+    return;
+  }
+  if ((team < 1) || (team > JOIN_TEAM_MAX) || (num > JOIN_NUM_MAX) || (pin > 9999))
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[JOIN] gecersiz parametre: takim=%u numara=%u\n\r", team, num);
+    Join_SendStatus();
+    return;
+  }
+  joinTeam = team;
+  joinNum = num;
+  joinPin = pin;
+  joinResult = 0;
+  joinState = JOIN_ST_WAITING;
+  joinDue = false;
+  UTIL_TIMER_Stop(&timerJoin);
+  UTIL_TIMER_SetPeriod(&timerJoin, 100 + (Rand32() % 400));
+  UTIL_TIMER_Start(&timerJoin);
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] parametreler alindi: takim=%u numara=%u, admin onayi istenecek\n\r", team, num);
+  Join_SendStatus();
+#else
+  (void)team; (void)num; (void)pin;
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] bu node'da JOIN kapali (JOIN_ENABLED=0)\n\r");
+  Join_SendStatus();
+#endif
+}
+
+/* Kimligi sil, UID adresine ve katilma moduna don (atildi / ayrildi). result telefona gider. */
+static void Join_Clear(uint8_t result)
+{
+#if (JOIN_ENABLED == 1)
+  Id_Erase();
+  myAddr = uidAddr;
+  vAddr[0] = uidAddr;
+  joinState = JOIN_ST_NEED_PARAMS;
+  joinResult = result;
+  joinTeam = 0;
+  joinNum = 0;
+  joinDue = false;
+  kickPending = false;
+  leaveTries = 0;
+  everInTable = false;                      /* mesh durumu bastan */
+  bootTime = UTIL_TIMER_GetCurrentTime();
+  UTIL_TIMER_Stop(&timerJoin);
+  UTIL_TIMER_SetPeriod(&timerJoin, 2000);
+  UTIL_TIMER_Start(&timerJoin);
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] kimlik silindi (%s): adres 0x%04X, konum yayini KAPALI, katilma modu\n\r",
+          (result == JOIN_RES_KICKED) ? "admin cikardi" : "takimdan ayrildi", myAddr);
+  Join_SendStatus();
+#else
+  (void)result;
+#endif
+}
+
+/* Telefondan "takimdan ayril" (0xCC): 0xA4'u 5 sn arayla en fazla 3 kez yolla */
+static void Join_Leave(void)
+{
+#if (JOIN_ENABLED == 1)
+  if ((joinState != JOIN_ST_JOINED) || kickPending)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[JOIN] ayrilma istegi yok sayildi (durum %u)\n\r", joinState);
+    Join_SendStatus();
+    return;
+  }
+  joinState = JOIN_ST_LEAVING;
+  joinResult = 0;
+  leaveTries = 0;
+  leaveMsgId = (uint8_t)Rand32();
+  joinDue = false;
+  UTIL_TIMER_Stop(&timerJoin);
+  UTIL_TIMER_SetPeriod(&timerJoin, 100 + (Rand32() % 400));
+  UTIL_TIMER_Start(&timerJoin);
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] takimdan ayriliniyor (0x%04X), admin'e bildirilecek\n\r", myAddr);
+  Join_SendStatus();
+#else
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] bu node'da JOIN kapali (JOIN_ENABLED=0)\n\r");
+  Join_SendStatus();
+#endif
+}
+
+/* 0xA3 geldi (dogrudan ya da aktarimla). Sadece kendi dev_id'mize bakariz. */
+static void Join_HandleKick(void)
+{
+#if (JOIN_ENABLED == 1)
+  uint32_t dev;
+  memcpy(&dev, &BufferRx[6], 4);
+  if (dev != myDevId)
+  {
+    return; /* baska cihaz */
+  }
+  uint16_t dst    = (uint16_t)(BufferRx[3] | (BufferRx[4] << 8));
+  uint8_t  msgId  = BufferRx[5];
+  uint8_t  reason = BufferRx[10];
+
+  if (reason == KICK_REASON_ADMIN)
+  {
+    if (((joinState == JOIN_ST_JOINED) || (joinState == JOIN_ST_LEAVING)) && (dst == myAddr))
+    {
+      /* ULASTI mevcut adresten gider; kimlik ULASTI'lar havaya cikinca silinir (Node_Process) */
+      if (!kickPending)
+      {
+        APP_LOG(TS_ON, VLEVEL_L, "[JOIN] ADMIN TAKIMDAN CIKARDI (0x%04X), ULASTI yollanip kimlik silinecek\n\r", myAddr);
+      }
+      kickPending = true;
+      kickedAddr = myAddr;
+      joinDue = false;
+      UTIL_TIMER_Stop(&timerJoin);          /* ayriliyorduk: A4 denemeleri biter */
+      Node_QueueAck(myAddr, ADDR_ADMIN, msgId, ACK_KIND_DELIVERED);
+    }
+    else if ((kickedAddr != 0) && (dst == kickedAddr))
+    {
+      /* Kimligi zaten sildik ama Zybo ULASTI'yi alamamis, tekrar denedi: eski adresten cevap ver */
+      APP_LOG(TS_ON, VLEVEL_L, "[JOIN] gec gelen KICK tekrari: eski adres 0x%04X'ten ULASTI\n\r", kickedAddr);
+      Node_QueueAck(kickedAddr, ADDR_ADMIN, msgId, ACK_KIND_DELIVERED);
+    }
+  }
+  else if (reason == KICK_REASON_LEAVE_OK)
+  {
+    if ((joinState == JOIN_ST_LEAVING) && (dst == myAddr))
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[JOIN] admin ayrilmayi onayladi\n\r");
+      Join_Clear(JOIN_RES_LEFT);
+    }
+  }
+#endif
+}
+
+/* Bu adresten yollanacak ACK kaldi mi */
+static bool Ack_Pending(uint16_t me)
+{
+  for (uint32_t i = 0; i < ACK_Q_SIZE; i++)
+  {
+    if (ackQ[i].active && (ackQ[i].me == me)) { return true; }
+  }
+  return false;
+}
+
+static void OnJoinTimer(void *context)
+{
+  joinDue = true;
+  PostEvent(EV_JOIN);
+}
+
+/* Katilma cevabi (0xA2) geldi: sadece kendi dev_id'mize bakariz */
+static void Join_HandleAnswer(void)
+{
+#if (JOIN_ENABLED == 1)
+  uint32_t dev;
+  memcpy(&dev, &BufferRx[6], 4);
+  if (dev != myDevId)
+  {
+    return; /* baska cihazin cevabi */
+  }
+  uint8_t  msgId = BufferRx[5];
+  uint16_t addr  = (uint16_t)(BufferRx[10] | (BufferRx[11] << 8));
+  uint8_t  team  = BufferRx[12];
+  uint8_t  num   = BufferRx[13];
+  uint8_t  res   = BufferRx[14];
+
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] cevap: sonuc=%u adres=0x%04X takim=%u numara=%u (msg %u) rssi=%d\n\r",
+          res, addr, team, num, msgId, RssiValue);
+
+  if (res == JOIN_RES_OK)
+  {
+    if (((addr & ADDR_JOINED_FLAG) == 0) || (addr >= 0xFF00))
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[JOIN] gecersiz adres, yok sayildi\n\r");
+      return;
+    }
+    if (joinState == JOIN_ST_JOINED)
+    {
+      if (myAddr == addr)
+      {
+        /* Ayni cevap tekrar geldi (3x yayin / Zybo tekrar denedi): ULASTI'yi tekrar yolla */
+        Node_QueueAck(myAddr, ADDR_ADMIN, msgId, ACK_KIND_DELIVERED);
+      }
+      else
+      {
+        APP_LOG(TS_ON, VLEVEL_L, "[JOIN] baska adres icin cevap (kimlik 0x%04X), yok sayildi\n\r", myAddr);
+      }
+      return;
+    }
+    if (!Id_Save(addr, team, num))
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[JOIN] UYARI: kimlik flash'a yazilamadi (yeniden baslayinca kaybolur)\n\r");
+    }
+    myAddr = addr;
+    vAddr[0] = addr;
+    joinTeam = team;
+    joinNum = num;
+    joinResult = JOIN_RES_OK;
+    joinState = JOIN_ST_JOINED;
+    joinDue = false;
+    UTIL_TIMER_Stop(&timerJoin);
+    APP_LOG(TS_ON, VLEVEL_L, "[JOIN] ONAYLANDI: yeni adres 0x%04X, konum yayini basliyor\n\r", myAddr);
+    Node_QueueAck(myAddr, ADDR_ADMIN, msgId, ACK_KIND_DELIVERED);
+    Join_SendStatus();
+  }
+  else
+  {
+    if (joinState != JOIN_ST_WAITING)
+    {
+      return;
+    }
+    joinState = JOIN_ST_FAILED;
+    joinResult = res;
+    if (res == JOIN_RES_NUM_TAKEN) { joinNum = num; }   /* Zybo'nun onerdigi bos numara */
+    joinDue = false;
+    UTIL_TIMER_Stop(&timerJoin);
+    APP_LOG(TS_ON, VLEVEL_L, "[JOIN] REDDEDILDI: sebep %u (1 PIN, 2 admin, 3 takim dolu, 4 numara dolu)\n\r", res);
+    Join_SendStatus();
+  }
+#endif
+}
+
+/* Kimlik kaydini oku: sihirli sayi, CRC ve bu kartin dev_id'si tutmali */
+static bool Id_Load(IdRec_t *r)
+{
+  memcpy(r, ID_FLASH_READ_PTR, sizeof(*r));
+  if (r->magic != ID_MAGIC) { return false; }
+  if (r->chk != Crc32((const uint8_t *)r, 12)) { return false; }
+  if (r->devId != myDevId) { return false; }          /* baska karttan kopyalanmis */
+  if (((r->addr & ADDR_JOINED_FLAG) == 0) || (r->addr >= 0xFF00)) { return false; }
+  return true;
+}
+
+/* Kimligi flash'in son sayfasina yaz (sayfa silinir, 2 x 64 bit yazilir, geri okunup kontrol edilir) */
+static bool Id_Save(uint16_t addr, uint8_t team, uint8_t num)
+{
+  IdRec_t r;
+  uint64_t dw[2];
+  uint32_t err = 0;
+  FLASH_EraseInitTypeDef e;
+  HAL_StatusTypeDef st;
+
+  r.magic = ID_MAGIC;
+  r.addr = addr;
+  r.team = team;
+  r.num = num;
+  r.devId = myDevId;
+  r.chk = Crc32((const uint8_t *)&r, 12);
+  memcpy(dw, &r, sizeof(dw));
+
+  HAL_FLASH_Unlock();
+  e.TypeErase = FLASH_TYPEERASE_PAGES;
+  e.Page = ID_FLASH_PAGE;
+  e.NbPages = 1;
+  st = HAL_FLASHEx_Erase(&e, &err);
+  if (st == HAL_OK) { st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, ID_FLASH_ADDR, dw[0]); }
+  if (st == HAL_OK) { st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, ID_FLASH_ADDR + 8U, dw[1]); }
+  HAL_FLASH_Lock();
+
+  IdRec_t chk;
+  return (st == HAL_OK) && Id_Load(&chk) && (chk.addr == addr);
+}
+
+static void Id_Erase(void)
+{
+  uint32_t err = 0;
+  FLASH_EraseInitTypeDef e;
+  HAL_FLASH_Unlock();
+  e.TypeErase = FLASH_TYPEERASE_PAGES;
+  e.Page = ID_FLASH_PAGE;
+  e.NbPages = 1;
+  (void)HAL_FLASHEx_Erase(&e, &err);
+  HAL_FLASH_Lock();
+}
+#endif /* GATEWAY_MODE == 0 */
+
+#if (GATEWAY_MODE == 1)
+/* Havadan katilma istegi (0xA1) geldi: (dev_id, req_seq) ile tekrar ele, Zybo'ya ilet */
+static void Gateway_HandleJoinReq(void)
+{
+  uint32_t dev;
+  uint8_t seq = BufferRx[5];
+  memcpy(&dev, &BufferRx[6], 4);
+  for (uint32_t i = 0; i < JOIN_SEEN_SIZE; i++)
+  {
+    if (joinSeen[i].used && (joinSeen[i].devId == dev) && (joinSeen[i].seq == seq))
+    {
+      return; /* ayni istegin kopyasi */
+    }
+  }
+  joinSeen[joinSeenIdx].devId = dev;
+  joinSeen[joinSeenIdx].seq = seq;
+  joinSeen[joinSeenIdx].used = true;
+  joinSeenIdx = (uint8_t)((joinSeenIdx + 1) % JOIN_SEEN_SIZE);
+
+  APP_LOG(TS_ON, VLEVEL_L, "[JOIN] istek: dev_id=0x%08X takim=%u numara=%u seq=%u fw=%u.%u rssi=%d\n\r",
+          (unsigned int)dev, BufferRx[10], BufferRx[11], seq, BufferRx[14], BufferRx[15], RssiValue);
+  Gateway_ForwardFrame(BufferRx, JOIN_REQ_LEN, RssiValue, SnrValue, "katilma istegi");
+}
+
+/* [AA 55 LEN | payload | RSSI | SNR | CRC8] ile Zybo'ya yolla (LEN = payload + 2) */
+static void Gateway_ForwardFrame(const uint8_t *payload, uint16_t len, int16_t rssi, int8_t snr, const char *what)
+{
+  static uint8_t frame[3 + (MAX_APP_BUFFER_SIZE - 2) + 2 + 1];
+  uint32_t i = 0;
+  if (len > (MAX_APP_BUFFER_SIZE - 2)) { return; }   /* LEN = len + 2 <= 255 */
+  if (rssi < -128) { rssi = -128; }
+  if (rssi > 127)  { rssi = 127; }
+  frame[i++] = GW_SYNC0;
+  frame[i++] = GW_SYNC1;
+  frame[i++] = (uint8_t)(len + 2);
+  memcpy(&frame[i], payload, len);
+  i += len;
+  frame[i++] = (uint8_t)(int8_t)rssi;
+  frame[i++] = (uint8_t)snr;
+  frame[i] = Crc8(&frame[2], i - 2);   /* LEN..SNR */
+  i++;
+  if (HAL_UART_Transmit(&huart1, frame, (uint16_t)i, 60) == HAL_OK)   /* 260 B @115200 ~ 23 ms */
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[GW] %s -> Zybo %d byte\n\r", what, (int)i);
+  }
+  else
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[GW] %s USART1 gonderim HATASI\n\r", what);
+  }
+}
+#endif /* GATEWAY_MODE == 1 */
+
+/* ======================== Faz 1 guvenlik ======================== */
+#if (SECURE_ENABLED == 1) && (GATEWAY_MODE == 0)
+/* Sayac sayfasini okuma adresi (test ortaminda degistirilebilsin diye makro) */
+#ifndef SEC_FLASH_READ_PTR
+#define SEC_FLASH_READ_PTR   ((const void *)SEC_CTR_FLASH_ADDR)
+#endif
+
+typedef enum { SEC_OK = 0, SEC_BAD, SEC_REPLAY } SecRes_t;
+typedef enum { SEC_RP_NONE = 0, SEC_RP_ENFORCE, SEC_RP_NOTE } SecRp_t;
+
+static void Sec_EraseCtrPage(void)
+{
+  uint32_t err = 0;
+  FLASH_EraseInitTypeDef e;
+  HAL_FLASH_Unlock();
+  e.TypeErase = FLASH_TYPEERASE_PAGES;
+  e.Page = SEC_CTR_PAGE;
+  e.NbPages = 1;
+  (void)HAL_FLASHEx_Erase(&e, &err);
+  HAL_FLASH_Lock();
+  secSlot = 0;
+  secNeedErase = false;
+}
+
+/* Sayaci sayfadaki bir sonraki bos yuvaya yaz: [sayac][~sayac]. Sayfa dolunca (256 yuva) silinir. */
+static void Sec_SaveCtr(uint32_t v)
+{
+  uint64_t dw = (uint64_t)v | ((uint64_t)(~v) << 32);
+  HAL_StatusTypeDef st;
+  if (secNeedErase || (secSlot >= SEC_CTR_SLOTS))
+  {
+    Sec_EraseCtrPage();
+  }
+  HAL_FLASH_Unlock();
+  st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SEC_CTR_FLASH_ADDR + 8U * secSlot, dw);
+  HAL_FLASH_Lock();
+  if (st != HAL_OK)
+  {
+    /* yuva bos degilmis: sayfayi sil, bastan yaz */
+    Sec_EraseCtrPage();
+    HAL_FLASH_Unlock();
+    st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SEC_CTR_FLASH_ADDR, dw);
+    HAL_FLASH_Lock();
+  }
+  secSlot++;
+  secSaved = v;
+  if (st != HAL_OK)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[SEC] sayac flash'a yazilamadi!\n\r");
+  }
+}
+
+/* Anahtari yukle, sayaci flash'tan geri getir (+256) ve hemen kaydet */
+static void Sec_Init(void)
+{
+  static const uint8_t key[16] = NET_KEY_BYTES;
+  const uint32_t *p = (const uint32_t *)SEC_FLASH_READ_PTR;
+  uint32_t last = 0;
+  bool found = false;
+
+  Aes_SetKey(key);
+  secSlot = SEC_CTR_SLOTS;   /* bos yuva bulunmazsa: sayfa dolu, ilk yazmada silinir */
+  secNeedErase = false;
+  for (uint32_t i = 0; i < SEC_CTR_SLOTS; i++)
+  {
+    uint32_t lo = p[2U * i];
+    uint32_t hi = p[2U * i + 1U];
+    if ((lo == 0xFFFFFFFFU) && (hi == 0xFFFFFFFFU))
+    {
+      secSlot = (uint16_t)i;
+      break;
+    }
+    if (hi == (uint32_t)~lo)
+    {
+      last = lo;
+      found = true;
+    }
+    else
+    {
+      secNeedErase = true;   /* bozuk yuva */
+    }
+  }
+  secCtr = found ? (last + SEC_CTR_STEP) : 1U;
+  Sec_SaveCtr(secCtr);
+  APP_LOG(TS_OFF, VLEVEL_M, "SECURE: acik (%s), dev_id=0x%08X, sayac=%u\n\r",
+          (SECURE_ONLY == 1) ? "sadece guvenli" : "duz + guvenli", (unsigned int)myDevId, (unsigned int)secCtr);
+  if ((key[0] == 0x00) && (key[1] == 0x01) && (key[2] == 0x02) && (key[15] == 0x0F))
+  {
+    APP_LOG(TS_OFF, VLEVEL_M, "!!! net_key.h TEST anahtari: sahada kullanmadan once degistirin !!!\n\r");
+  }
+}
+
+static uint32_t Sec_NextCtr(void)
+{
+  if (secCtr >= (secSaved + SEC_CTR_STEP))
+  {
+    Sec_SaveCtr(secCtr);   /* acilista +256 yapilacagi icin bu deger bir daha kullanilmaz */
+  }
+  return secCtr++;
+}
+
+static void Sec_Nonce(const uint8_t *hdr, uint8_t nonce[CCM_NONCE_LEN])
+{
+  uint32_t dev;
+  memcpy(&dev, &hdr[1], 4);
+  memcpy(nonce, &hdr[1], 8);                 /* dev_id(4) | sayac(4) */
+  nonce[8] = (dev == SEC_DEVID_ZYBO) ? SEC_DIR_ZYBO : SEC_DIR_NODE;
+  memset(&nonce[9], 0, 4);
+}
+
+/* Ic paketi zarfla: out = [0x51][dev_id][sayac][sifreli][MIC]. Donus: toplam boy */
+static uint16_t Sec_Wrap(const uint8_t *in, uint16_t len, uint8_t *out)
+{
+  uint8_t nonce[CCM_NONCE_LEN];
+  uint32_t c = Sec_NextCtr();
+  out[0] = SEC_VER;
+  memcpy(&out[1], &myDevId, 4);
+  memcpy(&out[5], &c, 4);
+  Sec_Nonce(out, nonce);
+  Ccm_Encrypt(nonce, out, SEC_HDR_LEN, in, &out[SEC_HDR_LEN], len, &out[SEC_HDR_LEN + len]);
+  return (uint16_t)(len + SEC_OVERHEAD);
+}
+
+/* Gonderen basina 32'lik pencere: daha once gorulmemis ve pencere icindeki sayac kabul */
+static bool Sec_ReplayOk(uint32_t dev, uint32_t ctr)
+{
+  SecPeer_t *p = NULL;
+  SecPeer_t *old = &secPeers[0];
+  for (uint32_t i = 0; i < SEC_REPLAY_SIZE; i++)
+  {
+    if ((secPeers[i].used != 0U) && (secPeers[i].devId == dev)) { p = &secPeers[i]; break; }
+    if (secPeers[i].used < old->used) { old = &secPeers[i]; }
+  }
+  secUseTick++;
+  if (p == NULL)
+  {
+    /* yeni gonderen (ya da en eski kaydin yerine): ilk paket kabul */
+    old->devId = dev;
+    old->last = ctr;
+    old->bits = 1U;
+    old->used = secUseTick;
+    return true;
+  }
+  p->used = secUseTick;
+  if (ctr > p->last)
+  {
+    uint32_t dlt = ctr - p->last;
+    p->bits = (dlt >= SEC_WIN) ? 1U : ((p->bits << dlt) | 1U);
+    p->last = ctr;
+    return true;
+  }
+  uint32_t back = p->last - ctr;
+  if (back >= SEC_WIN) { return false; }          /* cok eski */
+  if (p->bits & (1U << back)) { return false; }   /* zaten goruldu */
+  p->bits |= (1U << back);
+  return true;
+}
+
+/* Zarfi ac: MIC dogrula, istenirse sayaci kontrol et. out ile in ayri tampon olmali. */
+static SecRes_t Sec_Open(const uint8_t *in, uint16_t len, uint8_t *out, uint16_t *outLen, SecRp_t rp)
+{
+  uint8_t nonce[CCM_NONCE_LEN];
+  uint32_t dev, ctr;
+  uint16_t n;
+  if ((len < (SEC_OVERHEAD + 1U)) || (in[0] != SEC_VER)) { return SEC_BAD; }
+  n = (uint16_t)(len - SEC_OVERHEAD);
+  memcpy(&dev, &in[1], 4);
+  memcpy(&ctr, &in[5], 4);
+  Sec_Nonce(in, nonce);
+  if (!Ccm_Decrypt(nonce, in, SEC_HDR_LEN, &in[SEC_HDR_LEN], out, n, &in[SEC_HDR_LEN + n]))
+  {
+    return SEC_BAD;
+  }
+  if (rp != SEC_RP_NONE)
+  {
+    bool ok = Sec_ReplayOk(dev, ctr);
+    if (!ok && (rp == SEC_RP_ENFORCE)) { return SEC_REPLAY; }
+  }
+  *outLen = n;
+  return SEC_OK;
+}
+
+/* Alinan paketi coz, BufferRx'e duz (bugunku) haliyle koy. false = paketi at. */
+static bool Sec_Incoming(void)
+{
+  uint16_t n = 0;
+  uint16_t m = 0;
+  SecRes_t r;
+  secRawValid = false;
+  if ((BufferRx[0] != SEC_VER) || (RxBufferSize < (SEC_OVERHEAD + 1U)))
+  {
+#if (SECURE_ONLY == 1)
+    APP_LOG(TS_ON, VLEVEL_L, "[SEC] duz paket atildi (%u B)\n\r", (unsigned)RxBufferSize);
+    return false;
+#else
+    return true;   /* gecis: duz paket, eski yolla islenir */
+#endif
+  }
+  memcpy(secRaw, BufferRx, RxBufferSize);
+  secRawLen = RxBufferSize;
+  r = Sec_Open(secRaw, secRawLen, BufferRx, &n, SEC_RP_ENFORCE);
+  if (r == SEC_REPLAY)
+  {
+    secReplayDrop++;
+    return false;   /* tekrar (gateway'in ayni kopyasi ya da kayit) - sessizce at */
+  }
+  if (r != SEC_OK)
+  {
+    secMicFail++;
+#if (SECURE_ONLY == 0)
+    memcpy(BufferRx, secRaw, secRawLen);   /* 0x51 ile baslayan duz paket olabilir */
+    if (secRawLen >= SEC_PIPE_MIN_LEN)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[SEC] MIC hatasi (%u B), duz paket sayildi (toplam %u)\n\r",
+              (unsigned)secRawLen, (unsigned int)secMicFail);
+    }
+    return true;
+#else
+    APP_LOG(TS_ON, VLEVEL_L, "[SEC] MIC hatasi, paket atildi (%u B, toplam %u)\n\r",
+            (unsigned)secRawLen, (unsigned int)secMicFail);
+    return false;
+#endif
+  }
+  RxBufferSize = n;
+
+  /* Ic ice aktarim: icteki guvenli paketi de ac (dis zarfin sayaci zaten tekrari engelliyor) */
+  if (((BufferRx[0] == RELAY_TYPE_POS) || (BufferRx[0] == RELAY_TYPE_UL_CTRL)) &&
+      (n > (RELAY_POS_HDR + SEC_OVERHEAD)) && (BufferRx[RELAY_POS_HDR] == SEC_VER))
+  {
+    if (Sec_Open(&BufferRx[RELAY_POS_HDR], (uint16_t)(n - RELAY_POS_HDR), secInner, &m, SEC_RP_NONE) != SEC_OK)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[SEC] aktarilan ic paketin MIC'i hatali, atildi\n\r");
+      return false;
+    }
+    memcpy(&BufferRx[RELAY_POS_HDR], secInner, m);
+    RxBufferSize = (uint16_t)(RELAY_POS_HDR + m);
+  }
+  else if ((BufferRx[0] == RELAY_TYPE_DL) && (n > (RELAY_DL_HDR + SEC_OVERHEAD)) &&
+           (BufferRx[RELAY_DL_HDR] == SEC_VER))
+  {
+    /* Zybo'nun paketi: pencereye isle (dogrudan gelen kopya ile ayni sayac), ama kopyayi
+       atma: bugunku tekrar eleme ve aktarim bastirma kurallari ayni sekilde calissin */
+    if (Sec_Open(&BufferRx[RELAY_DL_HDR], (uint16_t)(n - RELAY_DL_HDR), secInner, &m, SEC_RP_NOTE) != SEC_OK)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[SEC] aktarilan downlink'in MIC'i hatali, atildi\n\r");
+      return false;
+    }
+    memcpy(&BufferRx[RELAY_DL_HDR], secInner, m);
+    RxBufferSize = (uint16_t)(RELAY_DL_HDR + m);
+  }
+  else
+  {
+    secRawValid = true;   /* dogrudan gelen guvenli paket: aktarilacaksa aynen tasinir */
+  }
+  return true;
+}
+
+/* Node'un havaya cikan her paketi buradan gecer */
+static void AirSend(const uint8_t *data, uint8_t len)
+{
+  if (((uint16_t)len + SEC_OVERHEAD) > MAX_APP_BUFFER_SIZE)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[SEC] paket zarfa sigmiyor (%u B), yollanmadi\n\r", (unsigned)len);
+    PostEvent(EV_TX_DONE);   /* txBusy takili kalmasin */
+    return;
+  }
+  uint16_t n = Sec_Wrap(data, len, secTxBuf);
+  RadioSend(secTxBuf, (uint8_t)n);
+}
+#endif /* SECURE_ENABLED && node */
+
+#if (SECURE_ENABLED == 1) && (GATEWAY_MODE == 1)
+/* Zybo'dan gelen hazir guvenli paketi kuyruga al. Kuyruk doluysa en eskinin kalan tekrarlari atilir. */
+static void SecTx_Add(const uint8_t *pkt, uint16_t len, uint8_t repeat)
+{
+  SecTx_t *s = NULL;
+  SecTx_t *old = NULL;
+  if (len > MAX_APP_BUFFER_SIZE) { return; }
+  for (uint32_t i = 0; i < SEC_TXQ_SIZE; i++)
+  {
+    if (!secTxQ[i].active) { s = &secTxQ[i]; break; }
+    if ((old == NULL) || (secTxQ[i].seq < old->seq)) { old = &secTxQ[i]; }
+  }
+  if (s == NULL)
+  {
+    s = old;
+    UTIL_TIMER_Stop(&s->timer);
+    APP_LOG(TS_ON, VLEVEL_L, "[GW] guvenli kuyruk dolu: en eski paketin kalan %u yayini atildi\n\r", s->left);
+  }
+  memcpy(s->buf, pkt, len);
+  s->len = (uint8_t)len;
+  s->left = repeat;
+  s->seq = ++secTxSeq;
+  s->active = true;
+  s->due = true;
+  APP_LOG(TS_ON, VLEVEL_L, "[GW] Zybo'dan guvenli paket %u B, %u kez yayinlanacak\n\r", (unsigned)len, repeat);
+}
+
+/* Zamani gelmis en eski guvenli paketi yayinla. true = TX basladi */
+static bool SecTx_Service(void)
+{
+  SecTx_t *pick = NULL;
+  for (uint32_t i = 0; i < SEC_TXQ_SIZE; i++)
+  {
+    SecTx_t *q = &secTxQ[i];
+    if (q->active && q->due && ((pick == NULL) || (q->seq < pick->seq))) { pick = q; }
+  }
+  if (pick == NULL) { return false; }
+  pick->due = false;
+  pick->left--;
+  if (pick->left == 0)
+  {
+    pick->active = false;
+  }
+  else
+  {
+    UTIL_TIMER_SetPeriod(&pick->timer, CMD_RELAY_GAP_MS + (Rand32() % 200));
+    UTIL_TIMER_Start(&pick->timer);
+  }
+  APP_LOG(TS_ON, VLEVEL_L, "[GW] guvenli paket yayinlandi (%u B, kalan %u)\n\r", pick->len, pick->left);
+  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); /* yesil = TX */
+  UTIL_TIMER_Start(&timerLed);
+  txBusy = true;
+  RadioSend(pick->buf, pick->len);
+  return true;
+}
+
+static void OnSecTxTimer(void *context)
+{
+  secTxQ[(uint32_t)context].due = true;
+  PostEvent(EV_SECTX);
+}
+#endif /* SECURE_ENABLED && gateway */
+
 
 /* [AA][55][LEN][payload][CRC8] cercevesini USART1'den yolla (Zybo / ESP32 ile ayni format) */
 static void Uart1_SendFrame(const uint8_t *payload, uint16_t len)
@@ -865,6 +2607,37 @@ static void Gateway_ForwardPacket(const pos_packet_t *pkt, int16_t rssi, int8_t 
     APP_LOG(TS_ON, VLEVEL_L, "[GW] USART1 gonderim HATASI\n\r");
   }
 }
+
+#if (GW_FORWARD_RELAY_INFO == 1)
+/* Aktarilmis konumu (0xE1, 17 B) [AA 55 13 | 17 B | RSSI | SNR | CRC8] ile Zybo'ya yolla */
+static void Gateway_ForwardRelayed(const uint8_t *relayPkt, int16_t rssi, int8_t snr)
+{
+  uint8_t frame[3 + GW_RELAY_FRAME_LEN_FIELD + 1];
+  uint32_t i = 0;
+
+  if (rssi < -128) { rssi = -128; }
+  if (rssi > 127)  { rssi = 127; }
+
+  frame[i++] = GW_SYNC0;
+  frame[i++] = GW_SYNC1;
+  frame[i++] = (uint8_t)GW_RELAY_FRAME_LEN_FIELD;
+  memcpy(&frame[i], relayPkt, RELAY_POS_LEN);
+  i += RELAY_POS_LEN;
+  frame[i++] = (uint8_t)(int8_t)rssi;
+  frame[i++] = (uint8_t)snr;
+  frame[i] = Crc8(&frame[2], i - 2);   /* LEN..SNR */
+  i++;
+
+  if (HAL_UART_Transmit(&huart1, frame, (uint16_t)i, 20) == HAL_OK)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[GW] aktarilmis konum -> Zybo %d byte\n\r", (int)i);
+  }
+  else
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[GW] aktarilmis konum USART1 gonderim HATASI\n\r");
+  }
+}
+#endif
 
 #endif /* GATEWAY_MODE == 1 (ForwardPacket) */
 
@@ -1091,9 +2864,27 @@ static void Node_Process(void)
      TX bitince gelen EV_TX_DONE bu fonksiyonu tekrar calistirir, o zaman yollanir. */
   /* Zybo'dan admin karari (0xC3) ya da admin isareti/komutu (0xC1, src 0xFFFE) geldiyse
      kendi tamponuna al, 3x yayinlanacak. Zybo'ya geri iletilmez. */
-  if (dlFrameReady && (dlFrameLen == CMD_PACKET_LEN) &&
-      ((dlFrame[0] == CMD_TYPE_DEL_ACK) || (dlFrame[0] == CMD_TYPE)))
+#if (SECURE_ENABLED == 1)
+  /* Zybo'dan hazir guvenli paket: [tx_repeat][0x51 ...]. Acilmaz, tx_repeat kez yayinlanir. */
+  if (dlFrameReady && (dlFrameLen >= (1U + SEC_OVERHEAD + 1U)) &&
+      (dlFrame[0] >= 1U) && (dlFrame[0] <= SEC_TX_REPEAT_MAX) && (dlFrame[1] == SEC_VER))
   {
+    SecTx_Add(&dlFrame[1], (uint16_t)(dlFrameLen - 1U), dlFrame[0]);
+    dlFrameReady = false;
+  }
+#if (SECURE_ONLY == 1)
+  if (dlFrameReady)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "[SEC] Zybo'dan duz downlink atildi (tip 0x%02X, SECURE_ONLY)\n\r", dlFrame[0]);
+    dlFrameReady = false;
+  }
+#endif
+#endif
+  if (dlFrameReady && (dlFrameLen == CMD_PACKET_LEN) &&
+      ((dlFrame[0] == CMD_TYPE_DEL_ACK) || (dlFrame[0] == CMD_TYPE) || (dlFrame[0] == JOIN_TYPE_ANS) ||
+       (dlFrame[0] == JOIN_TYPE_KICK)))
+  {
+    /* 0xA2 katilma cevabi / 0xA3 kick: admin karari gibi 3x yayin (0xC3 ile ayni tampon) */
     uint32_t r = (dlFrame[0] == CMD_TYPE) ? RELAY_ADMIN_CMD : RELAY_ADMIN;
     /* Kendi yayinimizi geri duyarsak (olmamali) ikinci kez islemeyelim */
     (void)Cmd_MarkSeen(dlFrame[0], (uint16_t)(dlFrame[1] | (dlFrame[2] << 8)), dlFrame[5]);
@@ -1107,6 +2898,13 @@ static void Node_Process(void)
     Gateway_SendDownlink();
     if (txBusy) { return; } /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
   }
+#if (SECURE_ENABLED == 1)
+  /* Zybo'nun guvenli paketlerinden zamani gelen varsa yayinla */
+  if (!txBusy && SecTx_Service())
+  {
+    return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
+  }
+#endif
   /* Tekrar yayin zamani gelmis paket varsa (once admin paketleri) */
   for (int32_t r = RELAY_COUNT_BUF - 1; (r >= 0) && !txBusy; r--)
   {
@@ -1136,6 +2934,64 @@ static void Node_Process(void)
 #endif
 
 #if (GATEWAY_MODE == 0)
+  /* Zamani gelmis ACK (ilk ya da tekrar) varsa yolla */
+  for (uint32_t i = 0; (i < ACK_Q_SIZE) && !txBusy; i++)
+  {
+    AckSlot_t *s = &ackQ[i];
+    if (!s->active || !s->due) { continue; }
+    s->due = false;
+    memset(ackTxBuf, 0, sizeof(ackTxBuf));
+    ackTxBuf[0] = CMD_TYPE_ACK;
+    ackTxBuf[1] = (uint8_t)(s->me & 0xFF);
+    ackTxBuf[2] = (uint8_t)(s->me >> 8);
+    ackTxBuf[3] = (uint8_t)(ADDR_ADMIN & 0xFF);
+    ackTxBuf[4] = (uint8_t)(ADDR_ADMIN >> 8);
+    ackTxBuf[5] = ackSeq++;
+    ackTxBuf[6] = s->kind;
+    ackTxBuf[7] = (uint8_t)(s->ackedSrc & 0xFF);
+    ackTxBuf[8] = (uint8_t)(s->ackedSrc >> 8);
+    ackTxBuf[9] = s->ackedId;
+    s->left--;
+    if (s->left == 0)
+    {
+      s->active = false;
+    }
+    else
+    {
+      UTIL_TIMER_SetPeriod(&s->timer, ACK_REPEAT_GAP_MIN_MS + (Rand32() % ACK_REPEAT_GAP_RAND_MS));
+      UTIL_TIMER_Start(&s->timer);
+    }
+    LogCmd("ACK yollandi", ackTxBuf);
+    APP_LOG(TS_OFF, VLEVEL_L, " (%d/%d)\n\r", (int)(ACK_REPEAT - s->left), ACK_REPEAT);
+    HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); /* yesil = TX */
+    UTIL_TIMER_Start(&timerLed);
+    txBusy = true;
+    AirSend(ackTxBuf, CMD_PACKET_LEN);
+    return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
+  }
+  /* Tek sekme mesh: zamani gelmis aktarim varsa yolla */
+  for (uint32_t i = 0; (i < RELAY_Q_SIZE) && !txBusy; i++)
+  {
+    RelaySlot_t *s = &relayQ[i];
+    if (!s->active || !s->due) { continue; }
+    s->active = false;
+    s->due = false;
+    if (s->buf[0] == RELAY_TYPE_POS)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarildi: konum 0x%04X seq=%d\n\r",
+              (unsigned)(s->buf[RELAY_POS_HDR] | (s->buf[RELAY_POS_HDR + 1] << 8)), s->buf[RELAY_POS_HDR + 2]);
+    }
+    else
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarildi: tip 0x%02X (ic tip 0x%02X, %d byte)\n\r",
+              s->buf[0], s->buf[(s->buf[0] == RELAY_TYPE_UL_CTRL) ? RELAY_UL_HDR : RELAY_DL_HDR], s->len);
+    }
+    HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); /* yesil = TX */
+    UTIL_TIMER_Start(&timerLed);
+    txBusy = true;
+    AirSend(s->buf, s->len);
+    return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
+  }
   /* Telefondan gelen komut / silme istegi varsa (radyo bossa) yolla */
   if (cmdTxPending && !txBusy)
   {
@@ -1144,13 +3000,101 @@ static void Node_Process(void)
     HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); /* yesil = TX */
     UTIL_TIMER_Start(&timerLed);
     txBusy = true;
-    RadioSend(cmdTxBuf, CMD_PACKET_LEN);
+    AirSend(cmdTxBuf, CMD_PACKET_LEN);
     return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
   }
 #endif
 
   /* Zamani gelmis bir sanal node varsa (ve radyo bossa) onun paketini yolla.
      Birden fazlasi ayni anda bekliyorsa siradakiler bu TX bitince (EV_TX_DONE) yollanir. */
+#if (GATEWAY_MODE == 0)
+  /* KICK: ULASTI'lar havaya ciktiysa kimligi sil */
+  if (kickPending && !Ack_Pending(kickedAddr))
+  {
+    Join_Clear(JOIN_RES_KICKED);
+  }
+  /* LEAVE: 0xA4'u yolla (5 sn arayla en fazla 3 kez); cevap gelmezse yine de ayril */
+  if ((joinState == JOIN_ST_LEAVING) && joinDue && !txBusy)
+  {
+    joinDue = false;
+    if (leaveTries >= LEAVE_TRIES)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[JOIN] ayrilma onayi gelmedi, yine de ayriliniyor\n\r");
+      Join_Clear(JOIN_RES_LEFT);
+    }
+    else
+    {
+      uint8_t a4[CMD_PACKET_LEN];
+      memset(a4, 0, sizeof(a4));
+      a4[0] = JOIN_TYPE_LEAVE;
+      a4[1] = (uint8_t)(myAddr & 0xFF);
+      a4[2] = (uint8_t)(myAddr >> 8);
+      a4[3] = (uint8_t)(ADDR_ADMIN & 0xFF);
+      a4[4] = (uint8_t)(ADDR_ADMIN >> 8);
+      a4[5] = leaveMsgId;                       /* denemelerde ayni (gateway / Zybo tekrar eler) */
+      memcpy(&a4[6], &myDevId, 4);
+      leaveTries++;
+      LogCmd("ayrilma yollandi", a4);
+      APP_LOG(TS_OFF, VLEVEL_L, " (%u/%u)\n\r", leaveTries, LEAVE_TRIES);
+      UTIL_TIMER_SetPeriod(&timerJoin, LEAVE_RETRY_MS);
+      UTIL_TIMER_Start(&timerJoin);
+      HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); /* yesil = TX */
+      UTIL_TIMER_Start(&timerLed);
+      txBusy = true;
+      AirSend(a4, CMD_PACKET_LEN);
+      return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
+    }
+  }
+  /* JOIN: kimlik yokken sadece katilma istegi (0xA1) yollanir */
+  if ((joinState == JOIN_ST_WAITING) && joinDue && !txBusy)
+  {
+    uint8_t a1[JOIN_REQ_LEN];
+    joinDue = false;
+    memset(a1, 0, sizeof(a1));
+    a1[0] = JOIN_TYPE_REQ;
+    a1[1] = 0x00;                               /* src: henuz adres yok */
+    a1[2] = 0x00;
+    a1[3] = (uint8_t)(ADDR_ADMIN & 0xFF);
+    a1[4] = (uint8_t)(ADDR_ADMIN >> 8);
+    a1[5] = joinReqSeq++;
+    memcpy(&a1[6], &myDevId, 4);                /* little-endian */
+    a1[10] = joinTeam;
+    a1[11] = joinNum;
+    a1[12] = (uint8_t)(joinPin & 0xFF);
+    a1[13] = (uint8_t)(joinPin >> 8);
+    a1[14] = (uint8_t)APP_VERSION_MAIN;
+    a1[15] = (uint8_t)APP_VERSION_SUB1;
+    a1[16] = 0xFF;                              /* pil olcumu yok */
+    APP_LOG(TS_ON, VLEVEL_L, "[JOIN] katilma istegi #%u: takim=%u numara=%u dev_id=0x%08X\n\r",
+            a1[5], joinTeam, joinNum, (unsigned int)myDevId);
+    Join_SendStatus();
+    UTIL_TIMER_SetPeriod(&timerJoin, JOIN_PERIOD_MS + (Rand32() % JOIN_PERIOD_RAND_MS));
+    UTIL_TIMER_Start(&timerJoin);
+    HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); /* yesil = TX */
+    UTIL_TIMER_Start(&timerLed);
+    txBusy = true;
+    AirSend(a1, JOIN_REQ_LEN);
+    return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
+  }
+  if (joinDue && (joinState == JOIN_ST_NEED_PARAMS))
+  {
+    /* Telefon parametreleri bilmiyorsa (yeniden baglandi vb.) durumu hatirlat */
+    joinDue = false;
+    Join_SendStatus();
+    UTIL_TIMER_SetPeriod(&timerJoin, JOIN_PERIOD_MS);
+    UTIL_TIMER_Start(&timerJoin);
+  }
+  /* JOIN: onay yokken konum yayinlanmaz (zamanlayici donmeye devam eder) */
+  if ((pendingTx != 0) &&
+      (((joinState != JOIN_ST_DISABLED) && (joinState != JOIN_ST_JOINED)) || kickPending))
+  {
+    for (uint32_t vi = 0; vi < VIRTUAL_NODES; vi++)
+    {
+      if (pendingTx & (1U << vi)) { ScheduleNextTx(vi); }
+    }
+    pendingTx = 0;
+  }
+#endif
   if ((pendingTx != 0) && !txBusy)
   {
     uint32_t vi = 0;
@@ -1174,7 +3118,7 @@ static void Node_Process(void)
     UTIL_TIMER_Start(&timerLed);
 
     txBusy = true;
-    RadioSend((const uint8_t *)&txPacket, sizeof(txPacket));
+    AirSend((const uint8_t *)&txPacket, sizeof(txPacket));
     ScheduleNextTx(vi);
     return; /* TX bitince (EV_TX_DONE) tekrar dinlemeye gececegiz */
   }

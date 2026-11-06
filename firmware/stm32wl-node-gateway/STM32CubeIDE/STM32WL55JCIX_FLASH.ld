@@ -49,7 +49,7 @@ MEMORY
 {
   RAM1   (xrw)   : ORIGIN = 0x20000000, LENGTH = 32K
   RAM2   (xrw)   : ORIGIN = 0x20008000, LENGTH = 32K
-  FLASH   (rx)   : ORIGIN = 0x08000000, LENGTH = 256K
+  FLASH   (rx)   : ORIGIN = 0x08000000, LENGTH = 252K   /* son 2 sayfa kod disi: 0x0803F000 = guvenlik sayaci, 0x0803F800 = JOIN kimlik kaydi */
 }
 
 /* Sections */

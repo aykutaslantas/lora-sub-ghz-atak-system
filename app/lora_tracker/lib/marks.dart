@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:latlong2/latlong.dart';
 
 import 'cmd_packet.dart';
+import 'teams.dart';
 
 enum MarkKind { poi, hazard, rally, cmdCome, cmdHold, cmdCheck }
 
@@ -142,10 +143,8 @@ class MapMark {
 
   bool get mine => src == null;
 
-  String get targetText => target == null ? 'Herkes' : CmdPacket.hex16(target!);
-  String get fromText => src == null
-      ? 'Ben'
-      : (src == addrAdmin ? 'ADMIN' : CmdPacket.hex16(src!));
+  String get targetText => target == null ? 'Herkes' : nodeName(target!);
+  String get fromText => src == null ? 'Ben' : nodeName(src!);
 
   String get timeText {
     String two(int v) => v.toString().padLeft(2, '0');

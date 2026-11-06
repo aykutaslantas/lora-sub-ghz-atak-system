@@ -78,6 +78,85 @@ class CmdPacket {
 
 int toE7(double deg) => (deg * 1e7).round();
 
+// ---------------- 0xC4: KONUMUMU AYARLA (telefon -> SADECE bagli node) ----------------
+// LoRa'ya hic cikmaz. Node bu konumu sahte konum yerine fix=1 ile yayinlar.
+// 60 sn yenisi gelmezse node sahte konuma doner, o yuzden periyodik yollanir.
+//   [0] 0xC4  [1..4] lat i32 x1e7  [5..8] lon i32 x1e7  [9] 1=ayarla / 0=kapat
+
+const int cmdTypeSetPos = 0xC4;
+
+/// p = null -> paylasimi kapat (node sahte konuma doner)
+List<int> encodeSetPos(LatLng? p) {
+  final b = ByteData(cmdLen);
+  b.setUint8(0, cmdTypeSetPos);
+  if (p != null) {
+    b.setInt32(1, toE7(p.latitude), Endian.little);
+    b.setInt32(5, toE7(p.longitude), Endian.little);
+    b.setUint8(9, 1);
+  }
+  return b.buffer.asUint8List();
+}
+
+// ---------------- 0xC5: KOMUT ACK (OKUNDU) ----------------
+// Kullanici admin komutunun uyarisinda Tamam / Bul'a basinca telefon yollar:
+// telefon -> ESP32 -> node -> LoRa -> gateway -> Zybo. Node adresini ve sayaci doldurur.
+// (ULASTI ACK'ini node kendisi yollar, telefonun isi yok.)
+//   [0] 0xC5 [1..2] src (node doldurur) [3..4] 0xFFFE [5] sayac (node) [6] tur
+//   [7..8] onaylanan komutun src [9] onaylanan komutun msgId [10..14] 0
+
+const int cmdTypeAck = 0xC5;
+const int ackKindDelivered = 1;
+const int ackKindSeen = 2;
+
+List<int> encodeSeenAck({required int targetSrc, required int targetMsgId}) {
+  final b = ByteData(cmdLen);
+  b.setUint8(0, cmdTypeAck);
+  b.setUint16(3, addrAdmin, Endian.little);
+  b.setUint8(6, ackKindSeen);
+  b.setUint16(7, targetSrc, Endian.little);
+  b.setUint8(9, targetMsgId & 0xFF);
+  return b.buffer.asUint8List();
+}
+
+// ---------------- 0xC6: NODE DURUMU (node -> telefon, dolayli onay) ----------------
+// Node her tablodan (10 sn) sonra yollar: Zybo'nun tablosunda kendi kaydi var mi?
+// Varsa son konumu admin'e ulasmis demektir. LoRa'ya cikmaz.
+//   [0] 0xC6 [1..2] node adresi [3] son yollanan seq [4] tabloda var mi
+//   [5] tablodaki seq [6] tablodaki flags [7] 0
+
+const int cmdTypeNodeStatus = 0xC6;
+const int nodeStatusLen = 8;
+
+class NodeStatus {
+  final int addr;
+  final int lastTxSeq;
+  final bool inTable;
+  final int tableSeq;
+  final int tableFlags;
+
+  const NodeStatus({
+    required this.addr,
+    required this.lastTxSeq,
+    required this.inTable,
+    required this.tableSeq,
+    required this.tableFlags,
+  });
+
+  /// Admin'deki kayit, son yolladigimizdan kac paket geride (0 = en son paket ulasti)
+  int get lag => (lastTxSeq - tableSeq) & 0xFF;
+
+  static NodeStatus? decode(List<int> d) {
+    if (d.length != nodeStatusLen || d[0] != cmdTypeNodeStatus) return null;
+    return NodeStatus(
+      addr: d[1] | (d[2] << 8),
+      lastTxSeq: d[3],
+      inTable: d[4] == 1,
+      tableSeq: d[5],
+      tableFlags: d[6],
+    );
+  }
+}
+
 // ---------------- Admin: BOLGEYE GERI DON (0xC1, tur 7) ----------------
 // Zybo, admin'in cizdigi alanin disina cikan node'a 60 sn'de bir yollar
 // (her seferinde yeni msgId). lat/lon = donulecek nokta (alanin ~20 m icinde).
@@ -174,6 +253,81 @@ class AdminDecision {
       targetSrc: d[7] | (d[8] << 8),
       targetMsgId: d[9],
       reqMsgId: d[10],
+    );
+  }
+}
+
+// ---------------- JOIN v1: takima katilma (telefon <-> SADECE bagli node) ----------------
+// LoRa'ya bunlar cikmaz; node admin'le 0xA1 / 0xA2 ile konusur.
+//   0xC9 KATILMA PARAMETRELERI (15 B): [1] takim 1..26 [2] numara 0..99 (0 = admin secsin)
+//        [3..4] PIN u16 LE (0..9999) [5..14] 0
+//   0xCC TAKIMDAN AYRIL (15 B): [1..14] 0. Node admin'e 0xA4 yollar, onay gelince
+//        (ya da 3 deneme bitince) kimligi siler.
+//   0xCB KATILMA DURUMU (node -> telefon, 8 B): [1] durum [2] sonuc [3..4] adres
+//        [5] takim [6] numara (sonuc 4'te onerilen numara) [7] istek sayaci
+//        sonuc: 0 ok, 1 yanlis PIN, 2 red, 3 takim dolu, 4 numara dolu,
+//               5 admin takimdan cikardi, 6 takimdan ayrildin
+
+const int cmdTypeJoinParams = 0xC9;
+const int cmdTypeLeave = 0xCC;
+const int cmdTypeJoinStatus = 0xCB;
+const int joinStatusLen = 8;
+
+List<int> encodeJoinParams(
+    {required int team, required int num, required int pin}) {
+  final b = ByteData(cmdLen);
+  b.setUint8(0, cmdTypeJoinParams);
+  b.setUint8(1, team);
+  b.setUint8(2, num);
+  b.setUint16(3, pin, Endian.little);
+  return b.buffer.asUint8List();
+}
+
+List<int> encodeLeave() {
+  final b = ByteData(cmdLen);
+  b.setUint8(0, cmdTypeLeave);
+  return b.buffer.asUint8List();
+}
+
+enum JoinState { disabled, needParams, waiting, joined, failed, leaving }
+
+class JoinStatus {
+  final JoinState state;
+  final int result; // 0 ok, 1 PIN, 2 red, 3 takim dolu, 4 numara dolu, 5 atildi, 6 ayrildi
+  final int addr;
+  final int team;
+  final int num;
+  final int reqSeq;
+
+  const JoinStatus({
+    required this.state,
+    required this.result,
+    required this.addr,
+    required this.team,
+    required this.num,
+    required this.reqSeq,
+  });
+
+  String get resultText => switch (result) {
+        1 => 'PIN yanlış',
+        2 => 'Admin reddetti',
+        3 => 'Takım dolu',
+        4 => 'Numara dolu (önerilen: $num)',
+        5 => 'Admin seni takımdan çıkardı',
+        6 => 'Takımdan ayrıldın',
+        _ => '',
+      };
+
+  static JoinStatus? decode(List<int> d) {
+    if (d.length != joinStatusLen || d[0] != cmdTypeJoinStatus) return null;
+    if (d[1] >= JoinState.values.length) return null;
+    return JoinStatus(
+      state: JoinState.values[d[1]],
+      result: d[2],
+      addr: d[3] | (d[4] << 8),
+      team: d[5],
+      num: d[6],
+      reqSeq: d[7],
     );
   }
 }

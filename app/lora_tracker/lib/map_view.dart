@@ -19,6 +19,7 @@ import 'location_service.dart';
 import 'marks.dart';
 import 'radial_menu.dart';
 import 'table_parser.dart';
+import 'teams.dart';
 
 const String kMapAsset = 'assets/map.mbtiles';
 
@@ -263,7 +264,7 @@ class _MapViewState extends State<MapView> {
               child: Row(children: [
                 const Icon(Icons.person),
                 const SizedBox(width: 12),
-                Text(n.addrHex, style: const TextStyle(fontFamily: 'monospace')),
+                Text(n.name, style: const TextStyle(fontFamily: 'monospace')),
               ]),
             ),
         ],
@@ -288,9 +289,10 @@ class _MapViewState extends State<MapView> {
       builder: (ctx) => _sheet(
         ctx,
         icon: Icons.location_on,
-        color: widget.stale ? Colors.grey : Colors.red,
-        title: n.addrHex,
+        color: widget.stale ? Colors.grey : nodeColor(n.addr),
+        title: n.name,
         lines: [
+          if (n.name != n.addrHex) 'Adres ${n.addrHex}',
           '${n.latText}, ${n.lonText}',
           'seq ${n.seq} · ${n.hasFix ? 'GPS fix var' : 'GPS fix yok (sahte konum)'}',
           if (widget.stale) 'Tablo güncel değil (30 sn+)',
@@ -445,7 +447,7 @@ class _MapViewState extends State<MapView> {
   // ---------------- Harita katmanlari ----------------
 
   Marker _nodeMarker(NodeRecord n) {
-    final color = widget.stale ? Colors.grey : Colors.red;
+    final color = widget.stale ? Colors.grey : nodeColor(n.addr);
     return Marker(
       point: LatLng(n.lat, n.lon),
       width: 90,
@@ -456,7 +458,7 @@ class _MapViewState extends State<MapView> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            _label(n.addrHex, color),
+            _label(n.name, color),
             Icon(Icons.location_on, color: color, size: 34),
           ],
         ),
@@ -847,9 +849,9 @@ class _MapViewState extends State<MapView> {
                           contentPadding:
                               const EdgeInsets.only(left: 12, right: 0),
                           leading: Icon(Icons.location_on,
-                              color: widget.stale ? Colors.grey : Colors.red),
+                              color: widget.stale ? Colors.grey : nodeColor(n.addr)),
                           minLeadingWidth: 20,
-                          title: Text(n.addrHex,
+                          title: Text(n.name,
                               style: const TextStyle(
                                   fontFamily: 'monospace',
                                   fontWeight: FontWeight.w600)),
