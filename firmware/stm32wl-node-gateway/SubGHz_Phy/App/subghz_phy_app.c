@@ -302,6 +302,38 @@ static bool     secRawValid = false;        /* true: son paket dogrudan guvenli 
 static uint8_t  secTxBuf[MAX_APP_BUFFER_SIZE];
 static uint8_t  secInner[MAX_APP_BUFFER_SIZE];
 static uint32_t secMicFail = 0, secReplayDrop = 0;
+/* Son dogrudan alinan guvenli paketin dis zarfi */
+static uint8_t  secRxVer = 0;               /* 0x51 / 0x52 (0 = duz ya da ic ice) */
+static uint32_t secRxDev = 0;               /* gonderenin dev_id'si */
+static uint32_t secRxRelayDev = SEC_RELAY_ANY; /* 0x52: gonderenin sectigi aktarici */
+/* Gateway baglanti kalitesi: Zybo'dan DOGRUDAN (E3 icinde degil) duydugumuz son paket */
+static uint32_t zyboDirectTime = 0;
+static int8_t   zyboDirectSnr = 0;
+static bool     zyboDirectEver = false;
+/* Aktarici secimi (uzak node): dogrudan duydugumuz komsular */
+typedef struct
+{
+  uint32_t devId;
+  uint16_t addr;
+  uint8_t  link;          /* uzak <-> komsu, LINK_Q(SNR) */
+  uint8_t  gwq;           /* komsunun kendi gateway kalitesi (bayrak bit3..6) */
+  uint32_t lastSeen;
+  uint32_t badTime;       /* kotu isaretlendigi an */
+  bool     bad;
+  bool     used;
+} Nb_t;
+static Nb_t     nbList[NB_MAX];
+static uint32_t curRelayDev = SEC_RELAY_ANY;   /* su anki secili aktarici */
+static uint32_t txRelayDev = SEC_RELAY_ANY;    /* yollanacak konum paketine yazilacak */
+/* Fallback: adini koydugumuz son konum aktarildi mi (aktaricinin E1'ini duyarak) */
+static bool     chkActive = false;
+static uint32_t chkDev = 0;
+static uint8_t  chkSeq = 0;
+static uint8_t  chkMiss = 0;
+/* Aktarildigini duydugumuz konumlarimiz (Zybo bit2 koymazsa tablo icin emniyet) */
+static struct { uint8_t seq; uint32_t t; bool used; } myRelayed[MY_RELAYED_SEQ_N];
+static uint8_t  myRelayedIdx = 0;
+static bool     sawViaBit = false;          /* Zybo tabloda bit2'yi koyuyor: emniyete gerek yok */
 #else
 /* ---- Faz 1 guvenlik (gateway): Zybo'dan gelen hazir guvenli paketler, tx_repeat kez ---- */
 typedef struct
@@ -381,6 +413,11 @@ static void RadioSend(const uint8_t *data, uint8_t len);
 static void Sec_Init(void);
 static bool Sec_Incoming(void);
 static void AirSend(const uint8_t *data, uint8_t len);
+static void Nb_Update(uint32_t dev, uint16_t addr, int8_t snr, uint8_t gwq);
+static uint32_t Relay_Choose(uint8_t seq);
+static void Relay_ResetChoice(void);
+static void Relay_NoteMine(uint16_t relayer, bool isPos, uint8_t seq);
+static bool Relay_TableGuard(uint8_t seq);
 #else
 #define AirSend(d, l)   RadioSend((d), (l))
 #endif
@@ -420,7 +457,11 @@ static void Relay_Cancel(uint32_t key, uint16_t byWhom);
 static void OnRelaySlotTimer(void *context);
 static uint32_t Hash24(const uint8_t *p, uint16_t n);
 static void Client_Touch(uint16_t addr);
+static void Client_Drop(uint16_t addr);
 static bool Client_IsActive(uint16_t addr);
+typedef enum { RLY_ANY = 0, RLY_ME, RLY_NO } RlyMode_t;
+static RlyMode_t Relay_RxMode(void);
+static uint8_t Node_GwQuality(void);
 static bool Client_AnyActive(void);
 static void HandleRelayedDl(void);
 #endif
@@ -792,6 +833,19 @@ static void BuildPositionPacket(pos_packet_t *pkt, uint32_t vi)
     relayReqLogged = false;
     APP_LOG(TS_ON, VLEVEL_L, "[MESH] tekrar dogrudan ulasiyorum: aktarim istegi kapandi\n\r");
   }
+  /* Komsular aktarici secerken baksin: bizim gateway baglanti kalitemiz (bit3..6) */
+  pkt->flags |= (uint8_t)((Node_GwQuality() << POS_FLAG_GWQ_SHIFT) & POS_FLAG_GWQ_MASK);
+#if (SECURE_ENABLED == 1)
+  /* Aktarici secimi: asil adresin aktarim isteyen konumu 0x52 zarfla, secilen komsunun adiyla */
+  if ((vi == 0) && (pkt->flags & POS_FLAG_RELAY_REQ))
+  {
+    txRelayDev = Relay_Choose(pkt->seq);
+  }
+  else if (vi == 0)
+  {
+    Relay_ResetChoice();
+  }
+#endif
 #endif
 }
 
@@ -811,7 +865,8 @@ static void HandleRxPacket(void)
 #if (SECURE_ENABLED == 1)
 #if (GATEWAY_MODE == 1)
   /* Gateway duz boru: guvenli paketi acmadan Zybo'ya ver (dogrulama / tekrar yayin Zybo'da) */
-  if ((BufferRx[0] == SEC_VER) && (RxBufferSize >= SEC_PIPE_MIN_LEN))
+  if (((BufferRx[0] == SEC_VER) && (RxBufferSize >= SEC_PIPE_MIN_LEN)) ||
+      ((BufferRx[0] == SEC_VER2) && (RxBufferSize >= SEC_PIPE_MIN_LEN2)))
   {
     Gateway_ForwardFrame(BufferRx, RxBufferSize, RssiValue, SnrValue, "guvenli paket");
     return;
@@ -977,16 +1032,38 @@ static void HandleRxPacket(void)
   LocalTable_Update(&pkt);
 #endif
 #else
+#if (SECURE_ENABLED == 1)
+  /* Aktarici secimi icin komsu listesi: dogrudan duydugumuz komsu, baglanti ve GW kalitesi */
+  if (secRxVer != 0)
+  {
+    Nb_Update(secRxDev, pkt.addr, SnrValue, (uint8_t)((pkt.flags & POS_FLAG_GWQ_MASK) >> POS_FLAG_GWQ_SHIFT));
+  }
+#endif
   /* Tek sekme mesh: komsu aktarim istiyor. Onu "musteri" olarak kaydet (asagi yon icin);
-     biz admin'e dogrudan ulasiyorsak konumunu aktar. */
+     biz admin'e dogrudan ulasiyorsak konumunu aktar. 0x52 ile aktaricisini secmisse sadece
+     secilen aktarir (hemen); baskasini sectiyse musterimiz degildir. */
   if (pkt.flags & POS_FLAG_RELAY_REQ)
   {
-    Client_Touch(pkt.addr);
-    if (Node_CanRelay())
+    RlyMode_t m = Relay_RxMode();
+    if (m == RLY_NO)
     {
-      Relay_Enqueue(RKEY(RTAG_POS, ((uint32_t)pkt.addr << 8) | pkt.seq), RELAY_TYPE_POS,
-                    true, RssiValue, SnrValue, (const uint8_t *)&pkt, sizeof(pkt),
-                    POS_RELAY_DELAY_MIN_MS, POS_RELAY_DELAY_RAND_MS, "konum");
+      Client_Drop(pkt.addr);
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] 0x%04X aktarimi baska komsudan istedi, aktarilmadi\n\r", pkt.addr);
+    }
+    else
+    {
+      Client_Touch(pkt.addr);
+      if (Node_CanRelay())
+      {
+        if (m == RLY_ME)
+        {
+          APP_LOG(TS_ON, VLEVEL_L, "[MESH] 0x%04X aktarici olarak beni secti\n\r", pkt.addr);
+        }
+        Relay_Enqueue(RKEY(RTAG_POS, ((uint32_t)pkt.addr << 8) | pkt.seq), RELAY_TYPE_POS,
+                      true, RssiValue, SnrValue, (const uint8_t *)&pkt, sizeof(pkt),
+                      (m == RLY_ME) ? RELAY_CHOSEN_DELAY_MIN_MS : POS_RELAY_DELAY_MIN_MS,
+                      (m == RLY_ME) ? RELAY_CHOSEN_DELAY_RAND_MS : POS_RELAY_DELAY_RAND_MS, "konum");
+      }
     }
   }
 #endif
@@ -1171,6 +1248,48 @@ static bool Client_AnyActive(void)
   return false;
 }
 
+/* Node aktarimi baska komsudan istedi: artik musterimiz degil (asagi aktarim da durur) */
+static void Client_Drop(uint16_t addr)
+{
+  for (uint32_t i = 0; i < MAX_RELAY_CLIENTS; i++)
+  {
+    if ((relayClients[i].addr == addr) && (addr != 0))
+    {
+      relayClients[i].addr = 0;
+    }
+  }
+}
+
+/* Su an islenen (dogrudan gelen) paketin aktarim kurali: 0x52'deki relay_dev'e gore */
+static RlyMode_t Relay_RxMode(void)
+{
+#if (SECURE_ENABLED == 1)
+  if ((secRxVer != SEC_VER2) || (secRxRelayDev == SEC_RELAY_ANY))
+  {
+    return RLY_ANY;
+  }
+  return (secRxRelayDev == myDevId) ? RLY_ME : RLY_NO;
+#else
+  return RLY_ANY;
+#endif
+}
+
+/* Bizim gateway baglanti kalitemiz (konum bayragi bit3..6). 0 = aktarici olamayiz:
+   son 25 sn'de kendimizi tabloda dogrudan gormedik (uplink kaniti) ya da Zybo'yu dogrudan duymadik */
+static uint8_t Node_GwQuality(void)
+{
+#if (SECURE_ENABLED == 1)
+  if (!Node_CanRelay() || !zyboDirectEver ||
+      ((UTIL_TIMER_GetCurrentTime() - zyboDirectTime) > REACH_TIMEOUT_MS))
+  {
+    return 0;
+  }
+  return (uint8_t)LINK_Q(zyboDirectSnr);
+#else
+  return 0;
+#endif
+}
+
 /* Aktarilmis downlink (0xE3) geldi: aktarim modundaysak icini gateway'den gelmis gibi isle */
 static void HandleRelayedDl(void)
 {
@@ -1269,6 +1388,12 @@ static void HandleRelayedPos(void)
   if (IsMyAddr(inner.addr))
   {
     APP_LOG(TS_ON, VLEVEL_L, "[MESH] konumum 0x%04X uzerinden aktarildi\n\r", relayer);
+#if (SECURE_ENABLED == 1)
+    if (inner.addr == myAddr)
+    {
+      Relay_NoteMine(relayer, true, inner.seq);
+    }
+#endif
   }
 #endif
 }
@@ -1296,6 +1421,12 @@ static void HandleRelayedUlCtrl(void)
 #else
   /* Baska komsu aktardi: bizim bekleyen ayni aktarimimizi iptal et */
   Relay_Cancel(RKEY(RTAG_UL(in[0]), ((uint32_t)src << 8) | in[5]), relayer);
+#if (SECURE_ENABLED == 1)
+  if (src == myAddr)
+  {
+    Relay_NoteMine(relayer, false, 0);   /* aktaricimiz calisiyor */
+  }
+#endif
 #endif
 }
 
@@ -1333,8 +1464,20 @@ static void HandleDownlinkTable(void)
       {
         /* Admin bizi sadece komsu uzerinden goruyor: aktarim istegini kapatma */
         lastViaRelayTime = UTIL_TIMER_GetCurrentTime();
+#if (SECURE_ENABLED == 1)
+        sawViaBit = true;
+#endif
         APP_LOG(TS_ON, VLEVEL_L, "[MESH] admin beni aktarimla goruyor (seq=%d)\n\r", rec.seq);
       }
+#if (SECURE_ENABLED == 1)
+      else if (Relay_TableGuard(rec.seq))
+      {
+        /* Emniyet: Zybo bit2'yi koymuyor ama bu konumumuzun komsu tarafindan aktarildigini
+           duyduk. Dogrudan sayarsak istek kapanir, 25 sn sonra yine acilir (salinim). */
+        lastViaRelayTime = UTIL_TIMER_GetCurrentTime();
+        APP_LOG(TS_ON, VLEVEL_L, "[MESH] tabloda bit2 yok ama seq=%d aktarildi (duyduk): aktarimla sayildi\n\r", rec.seq);
+      }
+#endif
       else
       {
         lastInTableTime = UTIL_TIMER_GetCurrentTime();
@@ -1458,14 +1601,19 @@ static void HandleCmdPacket(void)
 #if (GATEWAY_MODE == 0)
   if (!rxViaRelay && Node_CanRelay())
   {
-    /* Tek sekme mesh, yukari: musterinin 0xC1 / 0xC2 / 0xC5'ini gateway'e aktar */
-    if (fresh && Client_IsActive(c.src) &&
-        ((c.type == CMD_TYPE) || (c.type == CMD_TYPE_DEL_REQ) || (c.type == CMD_TYPE_ACK) ||
-         (c.type == JOIN_TYPE_LEAVE)))
+    /* Tek sekme mesh, yukari: musterinin 0xC1 / 0xC2 / 0xC5'ini gateway'e aktar.
+       0x52: aktarici olarak bizi sectiyse hemen, baskasini sectiyse hic. */
+    bool ulType = ((c.type == CMD_TYPE) || (c.type == CMD_TYPE_DEL_REQ) || (c.type == CMD_TYPE_ACK) ||
+                   (c.type == JOIN_TYPE_LEAVE));
+    RlyMode_t m = Relay_RxMode();
+    if (ulType && (m == RLY_ME)) { Client_Touch(c.src); }
+    if (ulType && (m == RLY_NO)) { Client_Drop(c.src); }
+    if (fresh && ulType && (m != RLY_NO) && Client_IsActive(c.src))
     {
       Relay_Enqueue(RKEY(RTAG_UL(c.type), ((uint32_t)c.src << 8) | c.msg_id), RELAY_TYPE_UL_CTRL,
                     true, RssiValue, SnrValue, BufferRx, CMD_PACKET_LEN,
-                    POS_RELAY_DELAY_MIN_MS, POS_RELAY_DELAY_RAND_MS, "kontrol (yukari)");
+                    (m == RLY_ME) ? RELAY_CHOSEN_DELAY_MIN_MS : POS_RELAY_DELAY_MIN_MS,
+                    (m == RLY_ME) ? RELAY_CHOSEN_DELAY_RAND_MS : POS_RELAY_DELAY_RAND_MS, "kontrol (yukari)");
       if (c.type == CMD_TYPE)
       {
         /* Gateway bunu 3x yayinlayinca donen kopyayi musteriye asagi aktaracagiz (✓✓ icin) */
@@ -2314,17 +2462,29 @@ static void Sec_Nonce(const uint8_t *hdr, uint8_t nonce[CCM_NONCE_LEN])
   memset(&nonce[9], 0, 4);
 }
 
-/* Ic paketi zarfla: out = [0x51][dev_id][sayac][sifreli][MIC]. Donus: toplam boy */
-static uint16_t Sec_Wrap(const uint8_t *in, uint16_t len, uint8_t *out)
+/* Ic paketi zarfla. v2 = false: [0x51][dev_id][sayac][sifreli][MIC]
+                    v2 = true:  [0x52][dev_id][sayac][relay_dev][sifreli][MIC]. Donus: toplam boy */
+static uint16_t Sec_Wrap2(const uint8_t *in, uint16_t len, uint8_t *out, bool v2, uint32_t relayDev)
 {
   uint8_t nonce[CCM_NONCE_LEN];
   uint32_t c = Sec_NextCtr();
-  out[0] = SEC_VER;
+  uint16_t hl = v2 ? SEC_HDR2_LEN : SEC_HDR_LEN;
+  out[0] = v2 ? SEC_VER2 : SEC_VER;
   memcpy(&out[1], &myDevId, 4);
   memcpy(&out[5], &c, 4);
+  if (v2)
+  {
+    memcpy(&out[9], &relayDev, 4);
+  }
   Sec_Nonce(out, nonce);
-  Ccm_Encrypt(nonce, out, SEC_HDR_LEN, in, &out[SEC_HDR_LEN], len, &out[SEC_HDR_LEN + len]);
-  return (uint16_t)(len + SEC_OVERHEAD);
+  Ccm_Encrypt(nonce, out, hl, in, &out[hl], len, &out[hl + len]);
+  return (uint16_t)(len + hl + SEC_MIC_LEN);
+}
+
+static uint16_t Sec_Wrap(const uint8_t *in, uint16_t len, uint8_t *out) __attribute__((unused));
+static uint16_t Sec_Wrap(const uint8_t *in, uint16_t len, uint8_t *out)
+{
+  return Sec_Wrap2(in, len, out, false, SEC_RELAY_ANY);
 }
 
 /* Gonderen basina 32'lik pencere: daha once gorulmemis ve pencere icindeki sayac kabul */
@@ -2362,20 +2522,31 @@ static bool Sec_ReplayOk(uint32_t dev, uint32_t ctr)
   return true;
 }
 
-/* Zarfi ac: MIC dogrula, istenirse sayaci kontrol et. out ile in ayri tampon olmali. */
-static SecRes_t Sec_Open(const uint8_t *in, uint16_t len, uint8_t *out, uint16_t *outLen, SecRp_t rp)
+/* Zarfi ac (0x51 ya da 0x52): MIC dogrula, istenirse sayaci kontrol et. out ile in ayri
+   tampon olmali. relayDev != NULL ise 0x52'nin relay_dev'i (0x51: SEC_RELAY_ANY) yazilir. */
+static SecRes_t Sec_OpenEx(const uint8_t *in, uint16_t len, uint8_t *out, uint16_t *outLen, SecRp_t rp,
+                           uint32_t *relayDev)
 {
   uint8_t nonce[CCM_NONCE_LEN];
   uint32_t dev, ctr;
-  uint16_t n;
-  if ((len < (SEC_OVERHEAD + 1U)) || (in[0] != SEC_VER)) { return SEC_BAD; }
-  n = (uint16_t)(len - SEC_OVERHEAD);
+  uint16_t n, hl;
+  if (len < 1U) { return SEC_BAD; }
+  if (in[0] == SEC_VER)       { hl = SEC_HDR_LEN; }
+  else if (in[0] == SEC_VER2) { hl = SEC_HDR2_LEN; }
+  else                        { return SEC_BAD; }
+  if (len < (hl + SEC_MIC_LEN + 1U)) { return SEC_BAD; }
+  n = (uint16_t)(len - hl - SEC_MIC_LEN);
   memcpy(&dev, &in[1], 4);
   memcpy(&ctr, &in[5], 4);
   Sec_Nonce(in, nonce);
-  if (!Ccm_Decrypt(nonce, in, SEC_HDR_LEN, &in[SEC_HDR_LEN], out, n, &in[SEC_HDR_LEN + n]))
+  if (!Ccm_Decrypt(nonce, in, hl, &in[hl], out, n, &in[hl + n]))
   {
     return SEC_BAD;
+  }
+  if (relayDev != NULL)
+  {
+    if (hl == SEC_HDR2_LEN) { memcpy(relayDev, &in[9], 4); }
+    else                    { *relayDev = SEC_RELAY_ANY; }
   }
   if (rp != SEC_RP_NONE)
   {
@@ -2386,14 +2557,23 @@ static SecRes_t Sec_Open(const uint8_t *in, uint16_t len, uint8_t *out, uint16_t
   return SEC_OK;
 }
 
+static SecRes_t Sec_Open(const uint8_t *in, uint16_t len, uint8_t *out, uint16_t *outLen, SecRp_t rp)
+{
+  return Sec_OpenEx(in, len, out, outLen, rp, NULL);
+}
+
 /* Alinan paketi coz, BufferRx'e duz (bugunku) haliyle koy. false = paketi at. */
 static bool Sec_Incoming(void)
 {
   uint16_t n = 0;
   uint16_t m = 0;
+  uint32_t rd = SEC_RELAY_ANY;
   SecRes_t r;
   secRawValid = false;
-  if ((BufferRx[0] != SEC_VER) || (RxBufferSize < (SEC_OVERHEAD + 1U)))
+  secRxVer = 0;
+  secRxRelayDev = SEC_RELAY_ANY;
+  if (!(((BufferRx[0] == SEC_VER) && (RxBufferSize >= (SEC_OVERHEAD + 1U))) ||
+        ((BufferRx[0] == SEC_VER2) && (RxBufferSize >= (SEC_OVERHEAD2 + 1U)))))
   {
 #if (SECURE_ONLY == 1)
     APP_LOG(TS_ON, VLEVEL_L, "[SEC] duz paket atildi (%u B)\n\r", (unsigned)RxBufferSize);
@@ -2404,7 +2584,7 @@ static bool Sec_Incoming(void)
   }
   memcpy(secRaw, BufferRx, RxBufferSize);
   secRawLen = RxBufferSize;
-  r = Sec_Open(secRaw, secRawLen, BufferRx, &n, SEC_RP_ENFORCE);
+  r = Sec_OpenEx(secRaw, secRawLen, BufferRx, &n, SEC_RP_ENFORCE, &rd);
   if (r == SEC_REPLAY)
   {
     secReplayDrop++;
@@ -2428,10 +2608,19 @@ static bool Sec_Incoming(void)
 #endif
   }
   RxBufferSize = n;
+  memcpy(&secRxDev, &secRaw[1], 4);
+  if (secRxDev == SEC_DEVID_ZYBO)
+  {
+    /* Zybo'yu DOGRUDAN duyduk (E3 icindekinin dis zarfi aktaranin): GW kalitesi icin SNR */
+    zyboDirectTime = UTIL_TIMER_GetCurrentTime();
+    zyboDirectSnr = SnrValue;
+    zyboDirectEver = true;
+  }
 
   /* Ic ice aktarim: icteki guvenli paketi de ac (dis zarfin sayaci zaten tekrari engelliyor) */
   if (((BufferRx[0] == RELAY_TYPE_POS) || (BufferRx[0] == RELAY_TYPE_UL_CTRL)) &&
-      (n > (RELAY_POS_HDR + SEC_OVERHEAD)) && (BufferRx[RELAY_POS_HDR] == SEC_VER))
+      (n > (RELAY_POS_HDR + SEC_OVERHEAD)) &&
+      ((BufferRx[RELAY_POS_HDR] == SEC_VER) || (BufferRx[RELAY_POS_HDR] == SEC_VER2)))
   {
     if (Sec_Open(&BufferRx[RELAY_POS_HDR], (uint16_t)(n - RELAY_POS_HDR), secInner, &m, SEC_RP_NONE) != SEC_OK)
     {
@@ -2457,21 +2646,215 @@ static bool Sec_Incoming(void)
   else
   {
     secRawValid = true;   /* dogrudan gelen guvenli paket: aktarilacaksa aynen tasinir */
+    secRxVer = secRaw[0];
+    secRxRelayDev = rd;
   }
   return true;
 }
 
-/* Node'un havaya cikan her paketi buradan gecer */
+/* Node'un havaya cikan her paketi buradan gecer. Aktarim istedigimiz paketler (bit1'li konum,
+   aktarim modundayken C1/C2/C5/A4) 0x52 zarfla, secilen aktaricinin dev_id'siyle gider. */
 static void AirSend(const uint8_t *data, uint8_t len)
 {
-  if (((uint16_t)len + SEC_OVERHEAD) > MAX_APP_BUFFER_SIZE)
+  bool v2 = false;
+  uint32_t rd = SEC_RELAY_ANY;
+  if ((len == sizeof(pos_packet_t)) && (data[11] & POS_FLAG_RELAY_REQ))
+  {
+    v2 = true;
+    if ((uint16_t)(data[0] | (data[1] << 8)) == myAddr) { rd = txRelayDev; }
+  }
+  else if ((len == CMD_PACKET_LEN) && Node_NeedsRelay() &&
+           ((data[0] == CMD_TYPE) || (data[0] == CMD_TYPE_DEL_REQ) || (data[0] == CMD_TYPE_ACK) ||
+            (data[0] == JOIN_TYPE_LEAVE)))
+  {
+    v2 = true;
+    rd = curRelayDev;
+  }
+  if (((uint16_t)len + (v2 ? SEC_OVERHEAD2 : SEC_OVERHEAD)) > MAX_APP_BUFFER_SIZE)
   {
     APP_LOG(TS_ON, VLEVEL_L, "[SEC] paket zarfa sigmiyor (%u B), yollanmadi\n\r", (unsigned)len);
     PostEvent(EV_TX_DONE);   /* txBusy takili kalmasin */
     return;
   }
-  uint16_t n = Sec_Wrap(data, len, secTxBuf);
+  uint16_t n = Sec_Wrap2(data, len, secTxBuf, v2, rd);
   RadioSend(secTxBuf, (uint8_t)n);
+}
+
+/* ---------------- Aktarici secimi (uzak node) ---------------- */
+
+static Nb_t *Nb_Find(uint32_t dev)
+{
+  for (uint32_t i = 0; i < NB_MAX; i++)
+  {
+    if (nbList[i].used && (nbList[i].devId == dev)) { return &nbList[i]; }
+  }
+  return NULL;
+}
+
+/* Dogrudan duydugumuz komsunun konumu: baglanti (bizim duydugumuz SNR) ve GW kalitesi */
+static void Nb_Update(uint32_t dev, uint16_t addr, int8_t snr, uint8_t gwq)
+{
+  uint32_t now = UTIL_TIMER_GetCurrentTime();
+  Nb_t *e = Nb_Find(dev);
+  if (e == NULL)
+  {
+    /* bos ya da en uzun suredir duyulmayan yuva */
+    e = &nbList[0];
+    for (uint32_t i = 0; i < NB_MAX; i++)
+    {
+      if (!nbList[i].used) { e = &nbList[i]; break; }
+      if ((now - nbList[i].lastSeen) > (now - e->lastSeen)) { e = &nbList[i]; }
+    }
+    memset(e, 0, sizeof(*e));
+    e->used = true;
+    e->devId = dev;
+  }
+  e->addr = addr;
+  e->link = (uint8_t)LINK_Q(snr);
+  e->gwq = gwq;
+  e->lastSeen = now;
+}
+
+/* Aday mi: son 30 sn'de duyuldu, gateway'e dogrudan ulasiyor (gwq > 0), kotu isaretli degil */
+static bool Nb_Usable(Nb_t *e, uint32_t now)
+{
+  if (!e->used || (e->gwq == 0) || ((now - e->lastSeen) > NB_TIMEOUT_MS)) { return false; }
+  if (e->bad && ((now - e->badTime) < NB_BAD_MS)) { return false; }
+  e->bad = false;
+  return true;
+}
+
+/* Puan: zayif halka belirler */
+static uint8_t Nb_Score(const Nb_t *e)
+{
+  return (e->link < e->gwq) ? e->link : e->gwq;
+}
+
+/* Aktarim isteyen konum paketimiz icin aktarici sec. Donus: dev_id ya da SEC_RELAY_ANY */
+static uint32_t Relay_Choose(uint8_t seq)
+{
+  uint32_t now = UTIL_TIMER_GetCurrentTime();
+  uint32_t prev = curRelayDev;
+  Nb_t *cur = NULL;
+  Nb_t *best = NULL;
+  Nb_t *sel;
+  uint32_t dev;
+
+  /* Fallback: bir onceki konumumuzu secili aktarici aktarmadi (E1'ini duymadik) */
+  if (chkActive)
+  {
+    chkActive = false;
+    if (++chkMiss >= NB_FAIL_MAX)
+    {
+      Nb_t *b = Nb_Find(chkDev);
+      if (b != NULL)
+      {
+        b->bad = true;
+        b->badTime = now;
+        APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarici 0x%04X %u kez aktarmadi: %u sn aday degil\n\r",
+                b->addr, (unsigned)chkMiss, (unsigned)(NB_BAD_MS / 1000));
+      }
+      if (curRelayDev == chkDev) { curRelayDev = SEC_RELAY_ANY; }
+      chkMiss = 0;
+    }
+  }
+
+  if (curRelayDev != SEC_RELAY_ANY)
+  {
+    cur = Nb_Find(curRelayDev);
+    if ((cur != NULL) && !Nb_Usable(cur, now)) { cur = NULL; }
+  }
+  for (uint32_t i = 0; i < NB_MAX; i++)
+  {
+    Nb_t *e = &nbList[i];
+    if (!Nb_Usable(e, now)) { continue; }
+    if ((best == NULL) || (Nb_Score(e) > Nb_Score(best)) ||
+        ((Nb_Score(e) == Nb_Score(best)) && (e->link > best->link)))
+    {
+      best = e;
+    }
+  }
+  /* Histerezis: mevcut aktarici gidene ya da digeri en az 2 basamak iyi olana kadar kalir */
+  if ((cur != NULL) && (best != NULL) && (Nb_Score(best) >= (uint8_t)(Nb_Score(cur) + NB_HYST_STEPS)))
+  {
+    sel = best;
+  }
+  else if (cur != NULL)
+  {
+    sel = cur;
+  }
+  else
+  {
+    sel = best;
+  }
+  dev = (sel != NULL) ? sel->devId : SEC_RELAY_ANY;
+  if (dev != prev)
+  {
+    if (sel != NULL)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarici secildi: 0x%04X (baglanti %u, GW %u)\n\r",
+              sel->addr, sel->link, sel->gwq);
+    }
+    else
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] uygun aktarici yok: herhangi bir komsu (FFFFFFFF)\n\r");
+    }
+    chkMiss = 0;
+  }
+  curRelayDev = dev;
+  if (dev != SEC_RELAY_ANY)
+  {
+    chkActive = true;
+    chkDev = dev;
+    chkSeq = seq;
+  }
+  return dev;
+}
+
+/* Tekrar dogrudan ulasiyoruz: secim durumunu sifirla */
+static void Relay_ResetChoice(void)
+{
+  curRelayDev = SEC_RELAY_ANY;
+  txRelayDev = SEC_RELAY_ANY;
+  chkActive = false;
+  chkMiss = 0;
+}
+
+/* Komsunun bizim paketimizi aktardigini duyduk (E1 konum / E2 kontrol) */
+static void Relay_NoteMine(uint16_t relayer, bool isPos, uint8_t seq)
+{
+  if (isPos)
+  {
+    myRelayed[myRelayedIdx].seq = seq;
+    myRelayed[myRelayedIdx].t = UTIL_TIMER_GetCurrentTime();
+    myRelayed[myRelayedIdx].used = true;
+    myRelayedIdx = (uint8_t)((myRelayedIdx + 1U) % MY_RELAYED_SEQ_N);
+  }
+  if (curRelayDev != SEC_RELAY_ANY)
+  {
+    Nb_t *b = Nb_Find(curRelayDev);
+    if ((b != NULL) && (b->addr == relayer))
+    {
+      if (isPos && chkActive && (seq == chkSeq)) { chkActive = false; }
+      chkMiss = 0;
+    }
+  }
+}
+
+/* Tabloda bit2'siz kaydimiz: Zybo bit2'yi hic koymadiysa ve bu seq'in aktarildigini
+   duyduysak aktarimla gelmis say (eski PL icin emniyet; Zybo bit2'yi koyunca devre disi) */
+static bool Relay_TableGuard(uint8_t seq)
+{
+  uint32_t now = UTIL_TIMER_GetCurrentTime();
+  if (sawViaBit) { return false; }
+  for (uint32_t i = 0; i < MY_RELAYED_SEQ_N; i++)
+  {
+    if (myRelayed[i].used && (myRelayed[i].seq == seq) && ((now - myRelayed[i].t) <= MY_RELAYED_SEQ_MS))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 #endif /* SECURE_ENABLED && node */
 
@@ -2978,8 +3361,9 @@ static void Node_Process(void)
     s->due = false;
     if (s->buf[0] == RELAY_TYPE_POS)
     {
-      APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarildi: konum 0x%04X seq=%d\n\r",
-              (unsigned)(s->buf[RELAY_POS_HDR] | (s->buf[RELAY_POS_HDR + 1] << 8)), s->buf[RELAY_POS_HDR + 2]);
+      /* adres/seq anahtardan: guvenli modda icerik uzak node'un sifreli paketi */
+      APP_LOG(TS_ON, VLEVEL_L, "[MESH] aktarildi: konum 0x%04X seq=%d (%d byte)\n\r",
+              (unsigned)((s->key >> 8) & 0xFFFFU), (int)(s->key & 0xFFU), s->len);
     }
     else
     {

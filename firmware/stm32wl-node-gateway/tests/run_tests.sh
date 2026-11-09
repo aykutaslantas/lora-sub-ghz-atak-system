@@ -28,6 +28,8 @@ run secure_node       test_secure.c       $S -DSECURE_ONLY=0 -DROLE=0 -DGATEWAY_
 run secure_node_only  test_secure.c       $S -DSECURE_ONLY=1 -DROLE=0 -DGATEWAY_MODE=0 -DJOIN_ENABLED=0 -DTEST_FAR_NODE=0 -DUIDW0=0x1764
 run secure_gateway    test_secure.c       $S -DSECURE_ONLY=0 -DROLE=1 -DGATEWAY_MODE=1 -DGW_FORWARD_CMD=1 -DGW_FORWARD_RELAY_INFO=1 -DGATEWAY_LOCAL_TABLE=0 -DTEST_GW_IGNORE_DIRECT=0 -DUIDW0=0x1764
 run secure_join       test_secure.c       $S -DSECURE_ONLY=0 -DROLE=2 -DGATEWAY_MODE=0 -DJOIN_ENABLED=1 -DTEST_FAR_NODE=0 -DUIDW0=0x9000ABCD
+run relay_sel_relayer test_relay_select.c $S -DSECURE_ONLY=1 -DROLE=0 -DGATEWAY_MODE=0 -DJOIN_ENABLED=0 -DTEST_FAR_NODE=0 -DUIDW0=0x1764
+run relay_sel_far_node test_relay_select.c $S -DSECURE_ONLY=1 -DROLE=1 -DGATEWAY_MODE=0 -DJOIN_ENABLED=0 -DTEST_FAR_NODE=0 -DUIDW0=0x0F53
 run secure_gw_only    test_secure_gw_only.c $S -DSECURE_ONLY=1 -DGATEWAY_MODE=1 -DGATEWAY_LOCAL_TABLE=0 -DTEST_GW_IGNORE_DIRECT=0 -DUIDW0=0x1764
 echo
 if [[ $fail == 0 ]]; then echo "TUM TESTLER GECTI"; else echo "BASARISIZ TEST VAR"; fi

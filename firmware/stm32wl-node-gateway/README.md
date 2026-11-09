@@ -1,6 +1,6 @@
 # STM32WL node / gateway firmware
 
-ST'nin `SubGHz_Phy_PingPong` örneği üzerine yazıldı; node ve gateway aynı kod tabanında, derleme bayraklarıyla seçilir. Sürüm: **V1.16.0** (`SubGHz_Phy/App/app_version.h`).
+ST'nin `SubGHz_Phy_PingPong` örneği üzerine yazıldı; node ve gateway aynı kod tabanında, derleme bayraklarıyla seçilir. Sürüm: **V1.17.0** (`SubGHz_Phy/App/app_version.h`).
 
 ## Hedef kartlar
 
@@ -42,7 +42,7 @@ Geçiş ya da test için: `SECURE_ONLY 0` düz paketleri de kabul eder, `SECURE_
 ## Log örneği
 
 ```
-APPLICATION_VERSION: V1.16.0
+APPLICATION_VERSION: V1.17.0
 JOIN: kayitli kimlik takim=1 numara=1 adres=0x8101
 SECURE: acik (sadece guvenli), dev_id=0xA3D2EEB3, sayac=513
 MODE=NODE

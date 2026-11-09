@@ -29,7 +29,7 @@ cd firmware/stm32wl-node-gateway/tests
 ./run_tests.sh
 ```
 
-Kapsananlar: AES-128 (FIPS-197) ve CCM test vektörleri, mesh aktarımı (iki yön, bastırma, salınım), gateway yönlendirmesi, JOIN/kick/leave, güvenli zarf, sayaç saklama, replay penceresi, sahte/bozuk paketlerin reddi, gateway kuyruğu.
+Kapsananlar: AES-128 (FIPS-197) ve CCM test vektörleri, mesh aktarımı (iki yön, bastırma, salınım), aktarıcı seçimi (puan, histerezis, yedeğe geçiş, 0x52), gateway yönlendirmesi, JOIN/kick/leave, güvenli zarf, sayaç saklama, replay penceresi, sahte/bozuk paketlerin reddi, gateway kuyruğu.
 
 ## Ölçümler
 

@@ -1,6 +1,6 @@
 # Protokol ve paket formatları
 
-Firmware V1.16.0. Tüm çok baytlı alanlar **little-endian**. Koordinatlar `derece × 1e7` olarak `int32` (ör. 40.9830600 → `409830600`).
+Firmware V1.17.0. Tüm çok baytlı alanlar **little-endian**. Koordinatlar `derece × 1e7` olarak `int32` (ör. 40.9830600 → `409830600`).
 
 Radyo: **869.525 MHz**, LoRa **SF7**, **BW 125 kHz**, CR 4/5, preamble 8, değişken uzunluk, en fazla 255 B. Paket türü ilk bayt ve uzunluktan ayırt edilir. `SECURE_ENABLED=1` iken havadaki her paket bölüm 6'daki zarfla sarılır; içteki paketler aşağıdakilerle aynıdır.
 
@@ -27,7 +27,7 @@ Radyo: **869.525 MHz**, LoRa **SF7**, **BW 125 kHz**, CR 4/5, preamble 8, deği�
 | 2 | `seq` | u8 | Her pakette +1 (kayıp sayımı) |
 | 3 | `lat` | i32 | Enlem × 1e7 |
 | 7 | `lon` | i32 | Boylam × 1e7 |
-| 11 | `flags` | u8 | bit0 GPS fix, bit1 "beni aktarın" (mesh), bit2 aktarımla ulaştı (gateway/Zybo koyar) |
+| 11 | `flags` | u8 | bit0 GPS fix, bit1 "beni aktarın" (mesh), bit2 aktarımla ulaştı (Zybo tabloda koyar), bit3..6 gateway bağlantı kalitesi 0–15 (aşağıda), bit7 yedek |
 
 Periyot 5000 ms + [0, 1000) ms rastgele. Konum telefondan gelir (`0xC4`); 60 sn gelmezse node sahte konuma döner (`fix=0`).
 
@@ -78,28 +78,41 @@ Node 25 sn boyunca tabloda kendini **doğrudan** ulaşmış olarak görmezse kon
 
 Aktaran, uzak node'u 30 sn boyunca "müşteri" sayar ve ona gelen tabloları/komutları E3 ile iletir. Aktarılan paket tekrar aktarılmaz.
 
+### 5.1 Aktarıcı seçimi (V1.17, güvenli modda)
+
+Uzak node aktarıcısını kendisi seçer; böylece en iyi komşu aktarır ve tek kopya çıkar.
+
+- **GW kalitesi (konum bayrağı bit3..6):** Son 25 sn'de kendini tabloda doğrudan görmüş node, Zybo'dan doğrudan duyduğu son paketin SNR'ını yazar: `clamp((SNR + 20) / 2, 1, 15)`. Görmediyse 0 (aktarıcı olamaz).
+- **Puan:** Uzak node son 30 sn'de doğrudan duyduğu komşular için `min(bağlantı, GW kalitesi)` hesaplar; bağlantı = komşuyu duyduğu SNR, aynı ölçekte. GW kalitesi 0 olan aday değildir.
+- **Histerezis:** Mevcut aktarıcı, gidene ya da başka biri en az 2 basamak iyi olana kadar kalır.
+- **Yedek:** Aktarıcının kendi konumunu aktardığını (E1) iki kez üst üste duymazsa o komşu 60 sn aday dışı kalır. Aday yoksa `relay_dev = FFFFFFFF` ve eski rastgele yarış.
+- **Aktarıcı kuralı:** `relay_dev` = benim dev_id → 20–70 ms içinde aktar; `FFFFFFFF` → 100–600 ms rastgele bekle ve bastır; başkası → aktarma (müşteri de sayma).
+- Zybo tabloda bit2'yi koymazsa uzak node, aktarıldığını duyduğu seq'leri aktarımla gelmiş sayar (istek açılıp kapanmasın). Zybo bit2'yi koyduğu anda bu emniyet devre dışı kalır.
+
 ## 6. Güvenli zarf (Faz 1, `SECURE_ENABLED=1`)
 
 ```
-[0x51][dev_id 4][sayaç 4][şifreli iç paket N][MIC 4]        boy = N + 13
+[0x51][dev_id 4][sayaç 4][şifreli iç paket N][MIC 4]                  boy = N + 13
+[0x52][dev_id 4][sayaç 4][relay_dev 4][şifreli iç paket N][MIC 4]     boy = N + 17
 ```
+`0x52` sadece aktarım isteyen paketlerde (bit1'li konum, aktarım modundayken C1/C2/C5/A4) kullanılır. `relay_dev` seçilen aktarıcının dev_id'sidir (`FFFFFFFF` = herhangi biri); açık başlıktadır, AAD'ye dahil olduğu için değiştirilemez.
 
 | Alan | Açıklama |
 |---|---|
 | Algoritma | AES-128-CCM, MIC 4 B, tek ortak ağ anahtarı (`net_key.h`, git'e girmez) |
 | Nonce (13 B) | `dev_id(4) \| sayaç(4) \| dir(1) \| 00 00 00 00`; dir 0 = node yollar, 1 = Zybo yollar |
-| AAD | Zarfın ilk 9 baytı (açık ama korunuyor) |
+| AAD | Zarfın açık başlığı: 0x51'de ilk 9, 0x52'de ilk 13 bayt |
 | Sayaç | Gönderen başına her pakette +1. Flash'ta ayrı bir sayfaya 256 pakette bir yazılır (sıradaki boş yuvaya), açılışta son kayıt + 256 ile devam eder |
 | Replay | Alıcı önce MIC'e, sonra sayaca bakar: gönderen başına son sayaç + 32'lik pencere; görülmüş ya da 32'den eski sayaç atılır |
 
 **İç içe aktarım:** Aktaran node uzak node'un güvenli paketini **açmadan** taşır:
 ```
-E1 / E2 iç = [E1|E2][aktaran 2][RSSI][SNR][uzak node'un güvenli paketi, aynen]   → havada 43 / 46 B
+E1 / E2 iç = [E1|E2][aktaran 2][RSSI][SNR][uzak node'un güvenli paketi, aynen]   → havada 43 / 46 B (içteki 0x52 ise 47 / 50 B)
 E3 iç      = [E3][aktaran 2][Zybo'nun güvenli paketi, aynen]                       → kontrol için 44 B
 ```
 Aynı paket hem doğrudan hem aktarımla gelirse içteki sayaç aynı olduğu için ikinci kopya tekrar diye atılır.
 
-**Gateway sadece boru:** Paketleri açmaz, anahtarı bilmez. 0x51 ile başlayan ve en az 25 B olan paketleri olduğu gibi Zybo'ya verir; Zybo'nun hazırladığı güvenli paketleri istenen sayıda yayınlar. Node'ların işaretlerini Zybo doğrulayıp yeniden yayınlar.
+**Gateway sadece boru:** Paketleri açmaz, anahtarı bilmez. 0x51 ile başlayan ve en az 25 B ya da 0x52 ile başlayan ve en az 29 B olan paketleri olduğu gibi Zybo'ya verir; Zybo'nun hazırladığı güvenli paketleri istenen sayıda yayınlar. Node'ların işaretlerini Zybo doğrulayıp yeniden yayınlar.
 
 **Test vektörü** (anahtar `00 01 02 … 0F`, dev_id `0x12345678`, sayaç 1, dir 0):
 ```

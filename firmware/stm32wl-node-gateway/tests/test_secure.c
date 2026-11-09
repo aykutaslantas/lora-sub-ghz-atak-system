@@ -37,6 +37,14 @@ int main(void){
     CHECK(txCount==0,"gateway guvenli paketi havada tekrar yayinlamadi (tekrar yayin Zybo'nun isi)");
     uc=uartCount; memset(b,0x51,46); b[0]=0x51; rx(b,46,-70);
     CHECK(uartCount==uc+1 && lastUartLen==52 && lastUart[2]==48,"ic ice E2 boyunda (46 B) paket LEN 48 ile iletildi");
+    { /* V1.17: 0x52 (aktarici secimli) uzak node konumu da acilmadan Zybo'ya */
+      uint8_t v2[29]={0x52,0x55,0xba,0xc8,0xa3,0x05,0x00,0x00,0x00,0x01,0x00,0x00,0xa0,0x33,0x2b,0xf5,0x23,0x54,0xfd,0xb4,0x65,0xf3,0x74,0xf4,0xb6,0x64,0xd4,0x02,0x46};
+      uc=uartCount; memcpy(BufferRx,v2,29); RxBufferSize=29; RssiValue=-90; SnrValue=-5; HandleRxPacket();
+      CHECK(uartCount==uc+1 && lastUartLen==35 && lastUart[2]==31 && memcmp(lastUart+3,v2,29)==0,"0x52 konum (29 B) LEN 31 ile aynen Zybo'ya");
+      hexdump("gw_uart_far_pos_v2",lastUart,lastUartLen);
+      uc=uartCount; memset(b,0x52,28); b[0]=0x52; rx(b,28,-70);
+      CHECK(uartCount==uc,"0x52 ile baslayan 28 B (guvenli icin fazla kisa) boruya alinmadi");
+    }
     memset(b,0x51,243); rx(b,243,-70);
     CHECK(lastUartLen==249 && lastUart[2]==245,"buyuk guvenli paket (243 B) LEN 245 ile iletildi");
   }

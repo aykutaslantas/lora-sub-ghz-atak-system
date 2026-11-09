@@ -50,10 +50,17 @@ typedef struct __attribute__((packed))
 /* bit1: gonderen admin'e ulasamiyor (REACH_TIMEOUT_MS boyunca tabloda kendini gormedi),
    admin'e ulasan bir komsu bu paketi bir kez aktarsin (tek sekme mesh) */
 #define POS_FLAG_RELAY_REQ   0x02
-/* bit2: GATEWAY koyar = bu konum Zybo'ya komsu uzerinden (0xE1) ulasti. Zybo bayraklari
-   oldugu gibi saklayip tabloda geri yolladigi icin node kendi kaydinda bunu gorur:
-   aktarimla ulasiyorsa "beni aktarin" istegini acik tutar (salinim olmaz). */
+/* bit2: bu konum Zybo'ya komsu uzerinden (0xE1) ulasti. Duz modda gateway koyar, guvenli
+   modda Zybo koyar (tabloda). Node kendi kaydinda bunu gorur: aktarimla ulasiyorsa
+   "beni aktarin" istegini acik tutar (salinim olmaz). */
 #define POS_FLAG_VIA_RELAY   0x04
+/* bit3..6: gonderenin gateway baglanti kalitesi (V1.17, aktarici secimi icin)
+   0     = son 25 sn'de kendini tabloda DOGRUDAN gormedi ya da Zybo'yu dogrudan duymadi
+   1..15 = Zybo'dan dogrudan duydugu son paketin SNR'i: clamp((SNR + 20) / 2, 1, 15)
+   bit7 yedek. */
+#define POS_FLAG_GWQ_SHIFT   3
+#define POS_FLAG_GWQ_MASK    0x78
+#define LINK_Q(snr)          ((((int)(snr) + 20) / 2) < 1 ? 1 : ((((int)(snr) + 20) / 2) > 15 ? 15 : (((int)(snr) + 20) / 2)))
 
 /* Faz 2: isaret / komut paketi, havaya giden 15 byte (little-endian, padding yok).
    Telefon -> BLE -> ESP32 -> UART -> node -> LoRa -> gateway (tekrar yayin) -> herkes */
@@ -317,6 +324,28 @@ typedef struct __attribute__((packed))
 #define SEC_DIR_NODE                                0x00
 #define SEC_DIR_ZYBO                                0x01
 #define SEC_PIPE_MIN_LEN                            25     /* gateway: 0x51 ile baslayan, en az bu boyda = guvenli */
+/* Zarf surum 2 (V1.17): SADECE aktarim isteyen node paketleri (bit1'li konum, aktarim
+   modundayken yollanan C1/C2/C5/A4). Uzak node aktaricisini kendi secer:
+   [0]=0x52 [1..4]=dev_id [5..8]=sayac [9..12]=relay_dev (u32 LE) [13..]=sifreli [son 4]=MIC
+   AAD = [0..12]: relay_dev okunabilir ama MIC ile korunur. nonce 0x51 ile ayni.
+   relay_dev = secilen komsunun dev_id'si; 0xFFFFFFFF = herhangi biri (eski rastgele yaris).
+   Aktarici: relay_dev == benim dev_id -> hemen aktar, 0xFFFFFFFF -> rastgele bekleme +
+   bastirma, baska -> aktarma. Ic ice boylar: E1 ici 34, E2 ici 37 (hava 47 / 50). */
+#define SEC_VER2                                    0x52
+#define SEC_HDR2_LEN                                13
+#define SEC_OVERHEAD2                               (SEC_HDR2_LEN + SEC_MIC_LEN)  /* = 17 */
+#define SEC_PIPE_MIN_LEN2                           29     /* gateway: 0x52 ile baslayan, en az bu boyda = guvenli */
+#define SEC_RELAY_ANY                               0xFFFFFFFFU
+/* Aktarici secimi (uzak node, sadece guvenli modda) */
+#define NB_MAX                                      8      /* takip edilen komsu */
+#define NB_TIMEOUT_MS                               30000  /* bu kadar duyulmayan komsu aday degil */
+#define NB_HYST_STEPS                               2      /* yeni aday en az bu kadar iyi olmali */
+#define NB_FAIL_MAX                                 2      /* ust uste bu kadar aktarilmayan konum -> kotu */
+#define NB_BAD_MS                                   60000  /* kotu isaretli komsu bu kadar aday degil */
+#define RELAY_CHOSEN_DELAY_MIN_MS                   20     /* secilen aktarici: 20..70 ms icinde */
+#define RELAY_CHOSEN_DELAY_RAND_MS                  50
+#define MY_RELAYED_SEQ_N                            8      /* aktarildigini duydugumuz son konumlarimiz */
+#define MY_RELAYED_SEQ_MS                           60000
 #define SEC_WIN                                     32     /* tekrar penceresi (sayac) */
 #define SEC_REPLAY_SIZE                             16     /* takip edilen gonderen sayisi */
 #define SEC_CTR_STEP                                256    /* sayac her 256 pakette flash'a yazilir, acilista +256 */

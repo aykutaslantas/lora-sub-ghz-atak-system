@@ -2,7 +2,7 @@
 
 Sahada birbirini göremeyen kişilerin **internet ve hücresel şebeke olmadan** birbirinin konumunu görebildiği, haritaya işaret koyup komut alabildiği bir takip sistemi. Her kişi bir **LoRa node** ve telefon taşır; konumlar 869 MHz'te bir **gateway**'e gider, **Zybo Z7-20** üzerindeki admin istasyonu paketleri donanımda (FPGA) doğrulayıp "kim nerede" tablosunu herkese geri yayınlar.
 
-> **Durum:** Çalışan prototip (Kasım 2026, firmware V1.16.0). Mentör liderliğinde 4 kişilik ekip projesi.
+> **Durum:** Çalışan prototip (Kasım 2026, firmware V1.17.0). Mentör liderliğinde 4 kişilik ekip projesi.
 > **Benim payım:** STM32WL node + gateway firmware'i, ESP32 BLE köprüsü, Flutter mobil uygulama, protokol tasarımı.
 
 ## Mimari
