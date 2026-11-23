@@ -54,11 +54,3 @@ Kapsananlar: AES-128 (FIPS-197) ve CCM test vektörleri, mesh aktarımı (iki y�
 | İki telefon birbirinin köprüsüne bağlanabiliyor | İki ESP32 aynı BLE adıyla yayın yapıyor | Bir köprünün adını ve o telefondaki `kDeviceName`'i değiştir |
 | dev_id log'da `0x%lX` görünüyor | Hafif printf `%l`'yi tanımıyor | `%08X` + `(unsigned int)` |
 
-## Yapılacaklar
-
-- [ ] Açık alanda gerçek menzil testi (görüş hattı, mesafe – RSSI – kayıp grafiği)
-- [ ] Gateway'i duymayan gerçek bir node ile mesh testi
-- [ ] Güvenlik Faz 2: node başına anahtar, grup anahtarı, atılan node'da anahtar yenileme
-- [ ] Ölçek: 20+ node için tablo bölme, uyarlamalı konum periyodu
-- [ ] Uygulama: bağlantı kopunca açık uyarı, tekil BLE adı / köprü seçme
-- [ ] Sahadan önce test anahtarını ve masa test modlarını kaldırmak
